@@ -390,12 +390,35 @@ settle() {
   LIMITED=()
 }
 
-# every profile at once: one slow account should not hold up the others.
+# launch <i> - ask for profile i with the login load_login just read.
 # ASKED counts the requests actually sent, so r can say when it sent none.
-ASKED=0
+ASKED=0; PIDS=(); LAUNCHED=()
+launch() {
+  ASKED=$(( ASKED + 1 ))
+  request "$TMPD/$1" "$TOKEN" &
+  PIDS+=("$!"); LAUNCHED+=("$1")
+}
+
+# reap - wait for every launched request and take its answer. A trapped
+# signal (a resize) cuts wait short, and collecting then would read
+# half-written files, so each request is waited on until it has finished.
+reap() {
+  local i p
+  TOKEN=""
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do
+    while kill -0 "$p" 2> /dev/null; do wait "$p"; done
+  done
+  for i in ${LAUNCHED[@]+"${LAUNCHED[@]}"}; do
+    [ -f "$TMPD/$i.rc" ] && collect "$i"
+  done
+  PIDS=(); LAUNCHED=()
+  settle
+}
+
+# every profile at once: one slow account should not hold up the others
 fetch_all() {
-  local i j p n=${#P_DIR[@]} pids=() follow=()
-  local -A asking=()
+  local i j k n=${#P_DIR[@]} follow=()
+  local -A asking=() own=()
   tick
   ASKED=0
   rm -f "$TMPD"/*
@@ -419,23 +442,27 @@ fetch_all() {
     # rather than spending the account's read a second time
     if [ -n "${asking[${P_KEY[i]}]:-}" ]; then follow+=("$i"); continue; fi
     asking[${P_KEY[i]}]=$i
-    ASKED=$(( ASKED + 1 ))
-    request "$TMPD/$i" "$TOKEN" &
-    pids+=("$!")
+    launch "$i"
   done
-  TOKEN=""
-  # a trapped signal (a resize) cuts wait short; collecting then would read
-  # half-written files, so wait again until each request has really finished
-  for p in ${pids[@]+"${pids[@]}"}; do
-    while kill -0 "$p" 2> /dev/null; do wait "$p"; done
-  done
-  for (( i = 0; i < n; i++ )); do
-    [ -f "$TMPD/$i.rc" ] && collect "$i"
-  done
-  settle
+  reap
+  # A follower takes its leader's answer: a 429, an outage or an odd reply
+  # belongs to the account. A rejected login belongs only to the leader dir's
+  # own token, so then one follower per account asks with its own login.
   for i in ${follow[@]+"${follow[@]}"}; do
+    k=${P_KEY[i]}
+    case ${P_NOTE[${asking[$k]}]} in
+      "login rejected"*)
+        if [ -z "${own[$k]:-}" ] && ! cache_fresh "$i" && load_login "$i"; then
+          own[$k]=$i; launch "$i"
+        fi ;;
+    esac
+  done
+  reap
+  for i in ${follow[@]+"${follow[@]}"}; do
+    k=${P_KEY[i]}
+    [ "${own[$k]:-}" = "$i" ] && continue
     cache_fresh "$i" && continue
-    j=${asking[${P_KEY[i]}]}
+    j=${own[$k]:-${asking[$k]}}
     backoff_load "$i"
     mark_stale "$i" "${P_NOTE[j]}"
   done

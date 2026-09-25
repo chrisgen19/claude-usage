@@ -98,7 +98,7 @@ answer() {
 }
 case $tok in
   tok-alpha|tok-max|tok-empty) cp "$STUB_FIX/$tok.json" "$out"; answer 200 ;;
-  tok-twin*|tok-switcher)      cp "$STUB_FIX/tok-alpha.json" "$out"; answer 200 ;;
+  tok-twin*|tok-switcher|tok-pairok) cp "$STUB_FIX/tok-alpha.json" "$out"; answer 200 ;;
   # the real limit: the first caller is answered, a second at the same moment
   # gets a 429
   tok-race)
@@ -429,6 +429,24 @@ done
 out=$(runin "$W/p/.claude-orga:$W/p/.claude-orgb" once)
 has   "one account in two organisations keeps two readings" "$(block_of "$out" ORGA)" " 45%"
 has   "each its own"                               "$(block_of "$out" ORGB)" " 92%"
+# two dirs on one account where the first-listed login is revoked: a 401 is
+# that dir's own token, so the other still asks with its own login
+mkprofile pair1 tok-rejected 3600
+mkprofile pair2 tok-pairok   3600
+for t in pair1 pair2; do
+  jq -n '{oauthAccount: {emailAddress: "pair@example.com", accountUuid: "uuid-pair",
+    organizationUuid: "org-pair"}}' > "$W/p/.claude-$t/.claude.json"
+done
+b1=$(asks tok-rejected); b2=$(asks tok-pairok)
+out=$(runin "$W/p/.claude-pair1:$W/p/.claude-pair2" once)
+has   "a revoked login is named on its own dir"    "$(block_of "$out" PAIR1)" "login rejected (401)"
+has   "the other dir on the account asks with its own login" "$(block_of "$out" PAIR2)" " 45%"
+lacks "and does not wear the first dir's rejection" "$(block_of "$out" PAIR2)" "login rejected"
+if [ "$(asks tok-rejected)" = $(( b1 + 1 )) ] && [ "$(asks tok-pairok)" = $(( b2 + 1 )) ]; then
+  pass "each login is sent once"
+else
+  fail "each login is sent once (revoked $(( $(asks tok-rejected) - b1 )), valid $(( $(asks tok-pairok) - b2 )))"
+fi
 
 # a dir that switches accounts during a wait: the wait was the old account's.
 # The old account earns it the real way, a 429 asking for 15 minutes.
