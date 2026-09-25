@@ -101,6 +101,9 @@ just short of its marker: on pace, with little room to spare.
 `as of 09:31 (3h ago)`, with the reason underneath. A window whose reset time
 has passed since then shows `0%  reset at ...`, because it restarted from zero.
 If you have used that account elsewhere since, the real figure may be higher.
+A reading belongs to the account it was read for: if a profile is logged into
+another account, the old reading is dropped rather than shown under the new
+name.
 
 ## Logins
 
@@ -114,7 +117,8 @@ The token never leaves memory except to go to `api.anthropic.com`:
 
 - It reaches `curl` on stdin (`-H @-`), never on a command line, so `ps` cannot
   show it.
-- The cache in `~/.cache/claude-usage/` holds numbers and timestamps only.
+- The cache in `~/.cache/claude-usage/` holds numbers only: when each reading
+  was taken, a checksum standing in for the account, and the readings.
 - Nothing is printed but the account's user name (the part before the `@`) and
   plan.
 
@@ -127,10 +131,13 @@ The self test asserts all three.
   `unexpected answer from the usage endpoint` rather than wrong numbers.
 - **It is rate-limited.** That is why the live view refreshes every 60 seconds
   by default and refuses anything under 30.
-- **macOS reads the Keychain.** The item name follows Claude Code 2.1: the first
-  8 hex characters of `sha256(CLAUDE_CONFIG_DIR)`, and no suffix for the default
-  `~/.claude`. The first read may ask for Keychain access; choose
-  *Always Allow*. This path has not been tested on a Mac with real logins yet.
+- **macOS reads the Keychain.** Claude Code 2.1 names the item for how it was
+  started: `Claude Code-credentials` with `CLAUDE_CONFIG_DIR` unset, otherwise
+  that plus `-` and the first 8 hex characters of `sha256(CLAUDE_CONFIG_DIR)`.
+  `~/.claude` tries both, every other profile the second. The first read may
+  ask for Keychain access; choose *Always Allow*. The self test covers this
+  through a stand-in `security`, but it has not been tried on a Mac with real
+  logins yet.
 - **The timezone is yours.** Reset times are shown in local time, using bash's
   own `strftime`, so GNU and BSD `date` never disagree.
 

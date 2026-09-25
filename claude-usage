@@ -50,10 +50,13 @@ palette() {
   fi
 }
 
+# Colour and glyphs are separate choices. NO_COLOR asks for no colour
+# (no-color.org) and says nothing about block characters, which only need a
+# terminal and a UTF-8 locale.
 ui_detect() {
   UI_COLOR=0; UI_UNICODE=0
-  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
-    UI_COLOR=1
+  if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then
+    [ -z "${NO_COLOR:-}" ] && UI_COLOR=1
     case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
       *UTF-8*|*utf-8*|*utf8*|*UTF8*) UI_UNICODE=1 ;;
     esac
@@ -113,6 +116,8 @@ P_STATE=()   # pending | ok | stale | none
 P_NOTE=()    # why a profile is not fresh, shown under its name
 P_AT=()      # epoch the shown numbers were read, 0 for never
 P_DATA=()    # "5h% 5h-reset 7d% 7d-reset opus% opus-reset sonnet% sonnet-reset", -1 = absent
+P_ACCT=()    # the account P_DATA was read for, as a cksum of its id; "" for none
+P_ID=()      # the account the dir is logged into now, the same way
 
 # cache_key <dir> - the dir's cache file name: readable, plus a checksum of the
 # exact path. Flattening alone maps ~/.claude-a b and ~/.claude-a_b to one file,
@@ -142,6 +147,7 @@ add_profile() {
     *) local cyc=("$C_M" "$C_BL" "$C_G" "$C_Y" "$C_C"); P_COL+=("${cyc[i % 5]}") ;;
   esac
   P_WHO+=(""); P_PLAN+=(""); P_STATE+=(pending); P_NOTE+=(""); P_AT+=(0); P_DATA+=("")
+  P_ACCT+=(""); P_ID+=("")
 }
 
 # CLAUDE_USAGE_DIRS when set, else every ~/.claude-*/ that Claude Code has
@@ -170,23 +176,30 @@ discover() {
 # treats a run of tabs as one.
 JQ_LOGIN='.claudeAiOauth // {} | [.accessToken // "", (.expiresAt // 0 | floor | tostring),
   .subscriptionType // "", .rateLimitTier // ""] | join("\u001f")'
+JQ_ACCOUNT='.oauthAccount // {} | [.emailAddress // "", .accountUuid // ""] | join("\u001f")'
 
-# macOS keeps the login in the Keychain, named after the config dir: the first
-# 8 hex of sha256(CLAUDE_CONFIG_DIR), no suffix at all for the default dir.
+# macOS keeps the login in the Keychain, named for how Claude Code was started
+# rather than for the dir: "Claude Code-credentials" with CLAUDE_CONFIG_DIR
+# unset, which can only mean ~/.claude, else that plus -<first 8 hex of
+# sha256(CLAUDE_CONFIG_DIR)>. ~/.claude may have been opened either way, so it
+# tries both; any other dir only ever has the second.
 keychain_login() {
-  local dir=$1 h svc
+  local dir=$1 h svc svcs=()
   command -v security > /dev/null || return 1
   h=$(printf '%s' "$dir" | shasum -a 256) || return 1
-  svc="Claude Code-credentials-${h:0:8}"
-  [ "$dir" = "$HOME/.claude" ] && [ -z "${CLAUDE_USAGE_DIRS:-}" ] && svc="Claude Code-credentials"
-  security find-generic-password -a "$USER" -s "$svc" -w 2> /dev/null
+  [ "$dir" = "$HOME/.claude" ] && svcs+=("Claude Code-credentials")
+  svcs+=("Claude Code-credentials-${h:0:8}")
+  for svc in "${svcs[@]}"; do
+    security find-generic-password -a "$USER" -s "$svc" -w 2> /dev/null && return 0
+  done
+  return 1
 }
 
 # load_login <i> - sets TOKEN and TOKEN_EXP (epoch ms), fills in who and plan.
 # TOKEN stays in this shell: it reaches jq and curl through pipes, never argv
 # and never a file.
 load_login() {
-  local i=$1 dir=${P_DIR[$1]} sub="" tier="" who
+  local i=$1 dir=${P_DIR[$1]} sub="" tier="" who="" uuid="" id
   TOKEN=""; TOKEN_EXP=0
   if [ -f "$dir/.credentials.json" ]; then
     IFS=$'\x1f' read -r TOKEN TOKEN_EXP sub tier < <(jq -r "$JQ_LOGIN" "$dir/.credentials.json" 2> /dev/null)
@@ -195,8 +208,14 @@ load_login() {
   fi
   [[ $TOKEN_EXP =~ ^[0-9]+$ ]] || TOKEN_EXP=0
   if [ -f "$dir/.claude.json" ]; then
-    who=$(jq -r '.oauthAccount.emailAddress // ""' "$dir/.claude.json" 2> /dev/null) || who=""
-    P_WHO[i]=${who%%@*}
+    IFS=$'\x1f' read -r who uuid < <(jq -r "$JQ_ACCOUNT" "$dir/.claude.json" 2> /dev/null)
+  fi
+  P_WHO[i]=${who%%@*}
+  # A dir can be logged out and into another account. A reading kept from the
+  # old one would then show under the new name, so it goes.
+  id=$(printf '%s' "${uuid:-$who}" | cksum); P_ID[i]=${id%% *}
+  if [ -n "${P_DATA[i]}" ] && [ "${P_ACCT[i]}" != "${P_ID[i]}" ]; then
+    P_DATA[i]=""; P_AT[i]=0; P_ACCT[i]=""; P_STATE[i]=pending
   fi
   P_PLAN[i]=$sub
   [[ $tier =~ max_([0-9]+x) ]] && P_PLAN[i]="$sub ${BASH_REMATCH[1]}"
@@ -205,19 +224,22 @@ load_login() {
 
 # ----------------------------------------------------------------- cache ----
 # Last good reading per profile, so an expired login or a dropped network still
-# shows something. Numbers and times only: nothing from the login lands here.
+# shows something. One line of numbers: when it was read, a cksum of the
+# account it was read for, then the readings. Nothing from the login lands here.
 cache_load() {
-  local i=$1 f="$CACHE_DIR/${P_KEY[$1]}" at data
+  local i=$1 f="$CACHE_DIR/${P_KEY[$1]}" at acct data
   [ -f "$f" ] || return 0
-  read -r at data < "$f" || return 0
-  [[ $at =~ ^[0-9]+$ ]] && valid_data "$data" || return 0
-  P_AT[i]=$at; P_DATA[i]=$data; P_STATE[i]=stale
+  read -r at acct data < "$f" || return 0
+  # a line from before readings carried their account fails here and is
+  # dropped rather than guessed at
+  [[ $at =~ ^[0-9]+$ ]] && [[ $acct =~ ^[0-9]+$ ]] && valid_data "$data" || return 0
+  P_AT[i]=$at; P_ACCT[i]=$acct; P_DATA[i]=$data; P_STATE[i]=stale
 }
 
 cache_save() {
   local f="$CACHE_DIR/${P_KEY[$1]}"
   ( umask 077; mkdir -p "$CACHE_DIR" ) || return 0
-  printf '%s %s\n' "${P_AT[$1]}" "${P_DATA[$1]}" > "$f.$$" && mv -f "$f.$$" "$f"
+  printf '%s %s %s\n' "${P_AT[$1]}" "${P_ACCT[$1]}" "${P_DATA[$1]}" > "$f.$$" && mv -f "$f.$$" "$f"
 }
 
 valid_data() { [[ $1 =~ ^-?[0-9]+( -?[0-9]+){7}$ ]]; }
@@ -283,7 +305,7 @@ collect() {
     mark_stale "$i" "unexpected answer from the usage endpoint"
     return 0
   fi
-  P_DATA[i]=$data; P_AT[i]=$NOW; P_STATE[i]=ok; P_NOTE[i]=""
+  P_DATA[i]=$data; P_ACCT[i]=${P_ID[i]}; P_AT[i]=$NOW; P_STATE[i]=ok; P_NOTE[i]=""
   cache_save "$i"
 }
 
