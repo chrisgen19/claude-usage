@@ -23,9 +23,15 @@ fi
 
 API_URL=https://api.anthropic.com/api/oauth/usage
 API_BETA=oauth-2025-04-20
+# The endpoint allows about one read a minute per account, and answers a
+# second one with a 429. Any claude-usage on this machine reuses a reading
+# younger than READ_GAP instead of asking again, and after a 429 that account
+# waits BACKOFF_FIRST, doubling up to BACKOFF_MAX.
+READ_GAP=60
 DEF_INTERVAL=60
-MIN_INTERVAL=30     # the endpoint rate-limits, and usage moves slower than this
-MANUAL_GAP=15       # r refreshes at most this often
+MIN_INTERVAL=$READ_GAP
+BACKOFF_FIRST=120
+BACKOFF_MAX=300
 SPAN_5H=18000
 SPAN_7D=604800
 CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/claude-usage
@@ -111,18 +117,19 @@ _clock() {
 }
 
 # -------------------------------------------------------------- profiles ----
-P_DIR=(); P_SHORT=(); P_KEY=(); P_LABEL=(); P_COL=(); P_WHO=(); P_PLAN=()
+P_DIR=(); P_SHORT=(); P_KEY=(); P_DKEY=(); P_LABEL=(); P_COL=(); P_WHO=(); P_PLAN=()
 P_STATE=()   # pending | ok | stale | none
 P_NOTE=()    # why a profile is not fresh, shown under its name
 P_AT=()      # epoch the shown numbers were read, 0 for never
 P_DATA=()    # "5h% 5h-reset 7d% 7d-reset opus% opus-reset sonnet% sonnet-reset", -1 = absent
 P_ACCT=()    # the account P_DATA was read for, as a cksum of its id; "" for none
 P_ID=()      # the account the dir is logged into now, the same way
+P_RETRY=()   # epoch before which this account is not asked again, 0 for none
 
-# cache_key <dir> - the dir's cache file name: readable, plus a checksum of the
-# exact path. Flattening alone maps ~/.claude-a b and ~/.claude-a_b to one file,
-# and then one profile shows the other's numbers. cksum is POSIX, so Linux and
-# macOS name the file the same way.
+# cache_key <dir> - the cache file name for a dir with no account on record:
+# readable, plus a checksum of the exact path. Flattening alone maps
+# ~/.claude-a b and ~/.claude-a_b to one file, and then one profile shows the
+# other's numbers. cksum is POSIX, so Linux and macOS name the file the same way.
 cache_key() {
   local sum safe=${1//[^A-Za-z0-9._-]/_}
   sum=$(printf '%s' "$1" | cksum) || sum=0
@@ -137,7 +144,7 @@ add_profile() {
   cache_key "$dir"
   P_DIR+=("$dir")
   P_SHORT+=("${dir/#"$HOME"/\~}")
-  P_KEY+=("$REPLY")
+  P_KEY+=("$REPLY"); P_DKEY+=("$REPLY")
   P_LABEL+=("${b^^}")
   # common profile names keep one colour everywhere; the rest take turns
   case ${b^^} in
@@ -147,7 +154,7 @@ add_profile() {
     *) local cyc=("$C_M" "$C_BL" "$C_G" "$C_Y" "$C_C"); P_COL+=("${cyc[i % 5]}") ;;
   esac
   P_WHO+=(""); P_PLAN+=(""); P_STATE+=(pending); P_NOTE+=(""); P_AT+=(0); P_DATA+=("")
-  P_ACCT+=(""); P_ID+=("")
+  P_ACCT+=(""); P_ID+=(""); P_RETRY+=(0)
 }
 
 # CLAUDE_USAGE_DIRS when set, else every ~/.claude-*/ that Claude Code has
@@ -176,7 +183,7 @@ discover() {
 # treats a run of tabs as one.
 JQ_LOGIN='.claudeAiOauth // {} | [.accessToken // "", (.expiresAt // 0 | floor | tostring),
   .subscriptionType // "", .rateLimitTier // ""] | join("\u001f")'
-JQ_ACCOUNT='.oauthAccount // {} | [.emailAddress // "", .accountUuid // ""] | join("\u001f")'
+JQ_ACCOUNT='.oauthAccount // {} | [.emailAddress // "", .accountUuid // "", .organizationUuid // ""] | join("\u001f")'
 
 # macOS keeps the login in the Keychain, named for how Claude Code was started
 # rather than for the dir: "Claude Code-credentials" with CLAUDE_CONFIG_DIR
@@ -199,7 +206,7 @@ keychain_login() {
 # TOKEN stays in this shell: it reaches jq and curl through pipes, never argv
 # and never a file.
 load_login() {
-  local i=$1 dir=${P_DIR[$1]} sub="" tier="" who="" uuid="" id
+  local i=$1 dir=${P_DIR[$1]} sub="" tier="" who="" uuid="" org="" id
   TOKEN=""; TOKEN_EXP=0
   if [ -f "$dir/.credentials.json" ]; then
     IFS=$'\x1f' read -r TOKEN TOKEN_EXP sub tier < <(jq -r "$JQ_LOGIN" "$dir/.credentials.json" 2> /dev/null)
@@ -208,14 +215,23 @@ load_login() {
   fi
   [[ $TOKEN_EXP =~ ^[0-9]+$ ]] || TOKEN_EXP=0
   if [ -f "$dir/.claude.json" ]; then
-    IFS=$'\x1f' read -r who uuid < <(jq -r "$JQ_ACCOUNT" "$dir/.claude.json" 2> /dev/null)
+    IFS=$'\x1f' read -r who uuid org < <(jq -r "$JQ_ACCOUNT" "$dir/.claude.json" 2> /dev/null)
   fi
   P_WHO[i]=${who%%@*}
+  # Usage belongs to an account in an organisation: one email can hold a Pro
+  # plan and a Team seat, each with its own limits and its own login. Readings
+  # and rate-limit waits are filed under that pair, so dirs logged into the
+  # same one share them, and a dir that switches finds the new one's. Ids that
+  # are not plain uuids go through cksum rather than being flattened together.
+  id=$(printf '%s' "${uuid:-$who}/$org" | cksum); P_ID[i]=${id%% *}
+  if [ -z "$uuid" ]; then P_KEY[i]=${P_DKEY[i]}
+  elif [[ "$uuid-$org" =~ ^[A-Za-z0-9-]+$ ]]; then P_KEY[i]="acct-$uuid-$org"
+  else P_KEY[i]="acct-${P_ID[i]}"
+  fi
   # A dir can be logged out and into another account. A reading kept from the
   # old one would then show under the new name, so it goes.
-  id=$(printf '%s' "${uuid:-$who}" | cksum); P_ID[i]=${id%% *}
   if [ -n "${P_DATA[i]}" ] && [ "${P_ACCT[i]}" != "${P_ID[i]}" ]; then
-    P_DATA[i]=""; P_AT[i]=0; P_ACCT[i]=""; P_STATE[i]=pending
+    P_DATA[i]=""; P_AT[i]=0; P_ACCT[i]=""; P_STATE[i]=pending; P_RETRY[i]=0
   fi
   P_PLAN[i]=$sub
   [[ $tier =~ max_([0-9]+x) ]] && P_PLAN[i]="$sub ${BASH_REMATCH[1]}"
@@ -226,14 +242,29 @@ load_login() {
 # Last good reading per profile, so an expired login or a dropped network still
 # shows something. One line of numbers: when it was read, a cksum of the
 # account it was read for, then the readings. Nothing from the login lands here.
+# cache_read <i> - the profile's cached line into CA_AT, CA_ACCT, CA_DATA.
+# A line from before readings carried their account fails here and is
+# dropped rather than guessed at.
+cache_read() {
+  local f="$CACHE_DIR/${P_KEY[$1]}"
+  CA_AT=""; CA_ACCT=""; CA_DATA=""
+  [ -f "$f" ] && read -r CA_AT CA_ACCT CA_DATA < "$f" || return 1
+  [[ $CA_AT =~ ^[0-9]+$ ]] && [[ $CA_ACCT =~ ^[0-9]+$ ]] && valid_data "$CA_DATA"
+}
+
 cache_load() {
-  local i=$1 f="$CACHE_DIR/${P_KEY[$1]}" at acct data
-  [ -f "$f" ] || return 0
-  read -r at acct data < "$f" || return 0
-  # a line from before readings carried their account fails here and is
-  # dropped rather than guessed at
-  [[ $at =~ ^[0-9]+$ ]] && [[ $acct =~ ^[0-9]+$ ]] && valid_data "$data" || return 0
-  P_AT[i]=$at; P_ACCT[i]=$acct; P_DATA[i]=$data; P_STATE[i]=stale
+  cache_read "$1" && [ "$CA_ACCT" = "${P_ID[$1]}" ] || return 0
+  P_AT[$1]=$CA_AT; P_ACCT[$1]=$CA_ACCT; P_DATA[$1]=$CA_DATA; P_STATE[$1]=stale
+}
+
+# cache_fresh <i> - take this account's reading from the cache when it is
+# younger than READ_GAP, whoever wrote it, instead of asking the endpoint.
+# This is what keeps a live view and a once run, or two live views, from
+# spending each other's one read a minute.
+cache_fresh() {
+  local i=$1
+  cache_read "$i" && [ "$CA_ACCT" = "${P_ID[i]}" ] && [ $(( NOW - CA_AT )) -lt "$READ_GAP" ] || return 1
+  P_AT[i]=$CA_AT; P_ACCT[i]=$CA_ACCT; P_DATA[i]=$CA_DATA; P_STATE[i]=ok; P_NOTE[i]=""
 }
 
 cache_save() {
@@ -243,6 +274,33 @@ cache_save() {
 }
 
 valid_data() { [[ $1 =~ ^-?[0-9]+( -?[0-9]+){7}$ ]]; }
+
+# The wait after a 429 sits beside the cache, "<not before> <429s in a row>",
+# so every claude-usage on the machine keeps to it. A success removes it.
+backoff_load() {  # <i> - sets P_RETRY, and REPLY to the streak
+  local f="$CACHE_DIR/${P_KEY[$1]}.retry" at n
+  P_RETRY[$1]=0; REPLY=0
+  [ -f "$f" ] && read -r at n < "$f" && [[ $at =~ ^[0-9]+$ ]] && [[ $n =~ ^[0-9]+$ ]] || return 0
+  P_RETRY[$1]=$at; REPLY=$n
+}
+
+# backoff_save <i> <retry-after> - the endpoint has sent retry-after: 0 and
+# then refused the retry, so its hint only counts when it asks for longer
+backoff_save() {
+  local i=$1 hint=$2 n k wait f="$CACHE_DIR/${P_KEY[$1]}.retry"
+  backoff_load "$i"; n=$(( REPLY + 1 ))
+  wait=$BACKOFF_FIRST
+  for (( k = 1; k < n && wait < BACKOFF_MAX; k++ )); do wait=$(( wait * 2 )); done
+  [ "$wait" -gt "$BACKOFF_MAX" ] && wait=$BACKOFF_MAX
+  if [[ $hint =~ ^[0-9]+$ ]] && [ "$hint" -gt "$wait" ]; then
+    wait=$(( hint > 3600 ? 3600 : hint ))
+  fi
+  P_RETRY[i]=$(( NOW + wait ))
+  ( umask 077; mkdir -p "$CACHE_DIR" ) || return 0
+  printf '%s %s\n' "${P_RETRY[i]}" "$n" > "$f.$$" && mv -f "$f.$$" "$f"
+}
+
+backoff_clear() { P_RETRY[$1]=0; rm -f "$CACHE_DIR/${P_KEY[$1]}.retry"; }
 
 # ----------------------------------------------------------------- fetch ----
 # resets_at carries microseconds and an offset, and fromdateiso8601 takes
@@ -272,7 +330,7 @@ def win($k): .[$k] as $w
 # token is never on a command line where ps could read it.
 request() {
   printf 'Authorization: Bearer %s\n' "$2" |
-    curl -sS --max-time 10 -o "$1.body" -w '%{http_code}' \
+    curl -sS --max-time 10 -D "$1.hdr" -o "$1.body" -w '%{http_code}' \
       -H @- -H "anthropic-beta: $API_BETA" -H 'Accept: application/json' \
       -A "$PROG/$VERSION" "$API_URL" > "$1.code" 2> "$1.err"
   printf '%s' "$?" > "$1.rc"
@@ -297,7 +355,10 @@ collect() {
   case $code in
     200) ;;
     401|403) mark_stale "$i" "login rejected ($code): open Claude Code with ${P_SHORT[i]} to renew it"; return 0 ;;
-    429)     mark_stale "$i" "rate limited: trying again at the next refresh"; return 0 ;;
+    429)
+      HINT[i]=$(awk -F': *' 'tolower($1) == "retry-after" { sub(/\r$/, "", $2); print $2; exit }' "$f.hdr" 2> /dev/null)
+      LIMITED+=("$i")
+      return 0 ;;
     *)       mark_stale "$i" "usage endpoint answered $code"; return 0 ;;
   esac
   data=$(jq -r "$JQ_USAGE" "$f.body" 2> /dev/null) || data=""
@@ -307,12 +368,59 @@ collect() {
   fi
   P_DATA[i]=$data; P_ACCT[i]=${P_ID[i]}; P_AT[i]=$NOW; P_STATE[i]=ok; P_NOTE[i]=""
   cache_save "$i"
+  backoff_clear "$i"
+}
+
+# Two claude-usage here can ask for one account in the same moment: one gets
+# the reading, the other a 429 for colliding with it. So before a 429 starts a
+# wait, a reading from the other gets up to 2s to land, and is taken if it does.
+LIMITED=(); HINT=()
+settle() {
+  local i k left=()
+  for (( k = 0; k < 10 && ${#LIMITED[@]} > 0; k++ )); do
+    [ "$k" -gt 0 ] && sleep 0.2
+    left=()
+    for i in "${LIMITED[@]}"; do cache_fresh "$i" || left+=("$i"); done
+    LIMITED=(${left[@]+"${left[@]}"})
+  done
+  for i in ${LIMITED[@]+"${LIMITED[@]}"}; do
+    backoff_save "$i" "${HINT[i]:-}"
+    mark_stale "$i" "rate limited"
+  done
+  LIMITED=()
+}
+
+# launch <i> - ask for profile i with the login load_login just read.
+# ASKED counts the requests actually sent, so r can say when it sent none.
+ASKED=0; PIDS=(); LAUNCHED=()
+launch() {
+  ASKED=$(( ASKED + 1 ))
+  request "$TMPD/$1" "$TOKEN" &
+  PIDS+=("$!"); LAUNCHED+=("$1")
+}
+
+# reap - wait for every launched request and take its answer. A trapped
+# signal (a resize) cuts wait short, and collecting then would read
+# half-written files, so each request is waited on until it has finished.
+reap() {
+  local i p
+  TOKEN=""
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do
+    while kill -0 "$p" 2> /dev/null; do wait "$p"; done
+  done
+  for i in ${LAUNCHED[@]+"${LAUNCHED[@]}"}; do
+    [ -f "$TMPD/$i.rc" ] && collect "$i"
+  done
+  PIDS=(); LAUNCHED=()
+  settle
 }
 
 # every profile at once: one slow account should not hold up the others
 fetch_all() {
-  local i p n=${#P_DIR[@]} pids=()
+  local i j k n=${#P_DIR[@]} follow=()
+  local -A asking=() own=()
   tick
+  ASKED=0
   rm -f "$TMPD"/*
   for (( i = 0; i < n; i++ )); do
     if ! load_login "$i"; then
@@ -324,19 +432,40 @@ fetch_all() {
       mark_stale "$i" "login expired $REPLY: open Claude Code with ${P_SHORT[i]} to renew it"
       continue
     fi
-    request "$TMPD/$i" "$TOKEN" &
-    pids+=("$!")
+    cache_fresh "$i" && continue
+    backoff_load "$i"
+    if [ "${P_RETRY[i]}" -gt "$NOW" ]; then
+      mark_stale "$i" "rate limited"
+      continue
+    fi
+    # a dir on an account already being asked this round takes that answer
+    # rather than spending the account's read a second time
+    if [ -n "${asking[${P_KEY[i]}]:-}" ]; then follow+=("$i"); continue; fi
+    asking[${P_KEY[i]}]=$i
+    launch "$i"
   done
-  TOKEN=""
-  # a trapped signal (a resize) cuts wait short; collecting then would read
-  # half-written files, so wait again until each request has really finished
-  for p in ${pids[@]+"${pids[@]}"}; do
-    while kill -0 "$p" 2> /dev/null; do wait "$p"; done
+  reap
+  # A follower takes its leader's answer: a 429, an outage or an odd reply
+  # belongs to the account. A rejected login belongs only to the leader dir's
+  # own token, so then one follower per account asks with its own login.
+  for i in ${follow[@]+"${follow[@]}"}; do
+    k=${P_KEY[i]}
+    case ${P_NOTE[${asking[$k]}]} in
+      "login rejected"*)
+        if [ -z "${own[$k]:-}" ] && ! cache_fresh "$i" && load_login "$i"; then
+          own[$k]=$i; launch "$i"
+        fi ;;
+    esac
   done
-  for (( i = 0; i < n; i++ )); do
-    [ -f "$TMPD/$i.rc" ] && collect "$i"
+  reap
+  for i in ${follow[@]+"${follow[@]}"}; do
+    k=${P_KEY[i]}
+    [ "${own[$k]:-}" = "$i" ] && continue
+    cache_fresh "$i" && continue
+    j=${own[$k]:-${asking[$k]}}
+    backoff_load "$i"
+    mark_stale "$i" "${P_NOTE[j]}"
   done
-  LAST_FETCH=$NOW
 }
 
 # ---------------------------------------------------------------- render ----
@@ -417,7 +546,7 @@ window_row() {
 }
 
 profile_block() {
-  local i=$1 line w=()
+  local i=$1 line note w=()
   line=" ${P_COL[i]}${C_B}${P_LABEL[i]}${C_0}"
   [ -n "${P_WHO[i]}" ] && line+="  ${P_WHO[i]}"
   [ -n "${P_PLAN[i]}" ] && line+="  ${C_DIM}${P_PLAN[i]}${C_0}"
@@ -429,9 +558,15 @@ profile_block() {
     esac
   fi
   OUT+=("$line")
-  if [ -n "${P_NOTE[i]}" ]; then
-    if [ "${P_STATE[i]}" = none ]; then OUT+=("   ${C_R}! ${P_NOTE[i]}${C_0}")
-    else OUT+=("   ${C_Y}! ${P_NOTE[i]}${C_0}")
+  note=${P_NOTE[i]}
+  if [ "$note" = "rate limited" ]; then
+    if [ "${P_RETRY[i]}" -gt "$NOW" ]; then _left $(( P_RETRY[i] - NOW )); note+=": next try in $REPLY"
+    else note+=": trying again at the next refresh"
+    fi
+  fi
+  if [ -n "$note" ]; then
+    if [ "${P_STATE[i]}" = none ]; then OUT+=("   ${C_R}! ${note}${C_0}")
+    else OUT+=("   ${C_Y}! ${note}${C_0}")
     fi
   fi
   if [ -z "${P_DATA[i]}" ]; then
@@ -467,7 +602,6 @@ render() {
 }
 
 # ------------------------------------------------------------------ live ----
-LAST_FETCH=0
 STTY_SAVED=""
 
 term_size() {
@@ -497,7 +631,7 @@ live_cleanup() {
 }
 
 watch_cmd() {
-  local interval=${1:-$DEF_INTERVAL} next=0 key
+  local interval=${1:-$DEF_INTERVAL} next=0 key manual=0 due=0
   case $interval in ''|*[!0-9]*) die "refresh interval must be a whole number of seconds" ;; esac
   [ "$interval" -ge "$MIN_INTERVAL" ] ||
     die "refresh interval must be at least ${MIN_INTERVAL}s - the usage endpoint rate-limits"
@@ -520,6 +654,12 @@ watch_cmd() {
       render live; paint
       fetch_all
       next=$(( NOW + interval ))
+      # an r that asked nothing keeps the refresh that was already due
+      if [ "$manual" = 1 ] && [ "$ASKED" = 0 ]; then
+        MSG="${C_Y}nothing to ask yet: each account is read at most once a minute${C_0}"
+        next=$due
+      fi
+      manual=0
     fi
     STATUS="${C_DIM}next in $(( next - NOW ))s${C_0}"
     render live; paint
@@ -528,10 +668,7 @@ watch_cmd() {
     read -rn1 -t 1 key <&3
     case $key in
       q|Q) break ;;
-      r|R)
-        if [ $(( NOW - LAST_FETCH )) -ge "$MANUAL_GAP" ]; then next=0
-        else MSG="${C_Y}read $(( NOW - LAST_FETCH ))s ago - try again in $(( MANUAL_GAP - NOW + LAST_FETCH ))s${C_0}"
-        fi ;;
+      r|R) [ "$manual" = 1 ] || due=$next; next=0; manual=1 ;;
     esac
   done
 }
@@ -589,6 +726,13 @@ ${C_B}READING IT${C_0}
   into that window you are, so a bar filled past it is on course to run out
   before the window resets.
 
+${C_B}RATE LIMITS${C_0}
+  The endpoint allows about one read a minute per account. A reading under
+  a minute old, from any $PROG on this machine or any profile on the
+  same account, is reused rather than asked for again, r included. After a
+  429 that account waits 2 minutes, then 4, then 5, and every $PROG
+  here keeps to the same wait.
+
 ${C_B}LOGINS${C_0}
   A login is read, never refreshed: refreshing rotates the token and can sign
   out a Claude session using that profile. When a login expires the profile
@@ -624,8 +768,8 @@ if [ "$cmd" = profiles ] || [ "$cmd" = ls ]; then profiles_cmd; exit 0; fi
 TMPD=$(mktemp -d "${TMPDIR:-/tmp}/claude-usage.XXXXXX") || die "cannot create a temp dir"
 trap cleanup EXIT
 for (( _i = 0; _i < ${#P_DIR[@]}; _i++ )); do
-  cache_load "$_i"
   load_login "$_i" || true
+  cache_load "$_i"
 done
 TOKEN=""
 

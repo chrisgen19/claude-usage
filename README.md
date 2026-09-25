@@ -79,12 +79,13 @@ ln -s "$PWD/claude-usage/claude-usage" ~/.local/bin/claude-usage
 | Command | What it does |
 | --- | --- |
 | `claude-usage` | Live view in a terminal; one snapshot when piped |
-| `claude-usage watch [secs]` | Live view, refreshing every `secs` (default 60, at least 30) |
+| `claude-usage watch [secs]` | Live view, refreshing every `secs` (default 60, at least 60) |
 | `claude-usage once` | Print one snapshot and exit |
 | `claude-usage profiles` | The profiles found and whether each login is still valid. No network |
 | `claude-usage help` | All of the above |
 
-Keys in the live view: `r` refreshes now (at most every 15s), `q` quits.
+Keys in the live view: `r` refreshes now, `q` quits. `r` keeps to the rate
+limit below, so an account read under a minute ago is not asked again.
 
 ## Reading it
 
@@ -101,9 +102,10 @@ just short of its marker: on pace, with little room to spare.
 `as of 09:31 (3h ago)`, with the reason underneath. A window whose reset time
 has passed since then shows `0%  reset at ...`, because it restarted from zero.
 If you have used that account elsewhere since, the real figure may be higher.
-A reading belongs to the account it was read for: if a profile is logged into
-another account, the old reading is dropped rather than shown under the new
-name.
+A reading belongs to the account and organisation it was read for (one email
+can hold a Pro plan and a Team seat, each with its own limits). If a profile is
+logged into another, the old reading is dropped rather than shown under the
+new name.
 
 ## Logins
 
@@ -118,7 +120,9 @@ The token never leaves memory except to go to `api.anthropic.com`:
 - It reaches `curl` on stdin (`-H @-`), never on a command line, so `ps` cannot
   show it.
 - The cache in `~/.cache/claude-usage/` holds numbers only: when each reading
-  was taken, a checksum standing in for the account, and the readings.
+  was taken, a checksum standing in for the account, and the readings. Files
+  are named for the account and organisation ids from `.claude.json`, which
+  are identifiers, not secrets.
 - Nothing is printed but the account's user name (the part before the `@`) and
   plan.
 
@@ -129,8 +133,17 @@ The self test asserts all three.
 - **The usage endpoint is not a public API.** It is what Claude Code's own
   `/usage` calls, and it could change without notice. If it does, profiles show
   `unexpected answer from the usage endpoint` rather than wrong numbers.
-- **It is rate-limited.** That is why the live view refreshes every 60 seconds
-  by default and refuses anything under 30.
+- **It is rate-limited,** to about one read a minute per account; a second one
+  gets a 429. So a reading under a minute old, taken by any `claude-usage` on
+  this machine, is reused instead of asked for again, which lets a live view
+  and a `once` run, or two live views, share the minute; so do two profiles
+  logged into the same account. If two copies still ask in the same moment,
+  the one that gets the 429 takes the other's reading instead of waiting.
+  After a real 429 that account waits 2 minutes, then 4, then 5, and the wait
+  is kept beside the cache so every `claude-usage` here keeps to it. The endpoint does send
+  `retry-after`, but has said `0` and then refused the retry, so it only
+  counts when it asks for longer. A copy on another machine cannot see any of
+  this, so it may still collide; the wait is what keeps that from repeating.
 - **macOS reads the Keychain.** Claude Code 2.1 names the item for how it was
   started: `Claude Code-credentials` with `CLAUDE_CONFIG_DIR` unset, otherwise
   that plus `-` and the first 8 hex characters of `sha256(CLAUDE_CONFIG_DIR)`.
