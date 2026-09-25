@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+# selftest - assert claude-usage reads, reports and caches usage correctly,
+# and that a login never leaks into a command line, the cache or the screen.
+#
+# Nothing here touches the network or a real login: curl is a stub on PATH that
+# answers by token, and every profile is a throwaway directory. Both the ci and
+# release workflows run this.
+
+set -uo pipefail
+
+cd "$(dirname "$0")/.." || exit 1
+
+export NO_COLOR=1
+CU=$PWD/claude-usage
+fails=0
+
+pass()  { printf '  ok    %s\n' "$1"; }
+fail()  { printf '  FAIL  %s\n' "$1" >&2; fails=$(( fails + 1 )); }
+group() { printf '\n%s\n' "$1"; }
+
+# ok <description> <command...>   - command must succeed
+ok() {
+  local desc="$1"; shift
+  if "$@" > /dev/null; then pass "$desc"; else fail "$desc (exit $?)"; fi
+}
+
+# rejects <description> <command...>   - command must fail
+rejects() {
+  local desc="$1"; shift
+  if "$@" > /dev/null 2>&1; then fail "$desc (unexpectedly succeeded)"; else pass "$desc"; fi
+}
+
+# has / lacks <description> <text> <substring>
+has() {
+  case "$2" in
+    *"$3"*) pass "$1" ;;
+    *)      fail "$1 (wanted '$3' in: $(printf '%s' "$2" | tr '\n' '|' | cut -c1-240))" ;;
+  esac
+}
+lacks() {
+  case "$2" in
+    *"$3"*) fail "$1 (found '$3')" ;;
+    *)      pass "$1" ;;
+  esac
+}
+
+# line_of <text> <label> - the output line for one profile's window, e.g. "5h"
+# under ALPHA, so an assertion cannot pass on another profile's numbers
+block_of() { printf '%s\n' "$1" | awk -v p="$2" '$1 == p { on = 1; print; next } /^ [A-Z]/ { on = 0 } on'; }
+
+[ -x "$CU" ] || { echo "selftest: no executable claude-usage here" >&2; exit 1; }
+command -v jq > /dev/null || { echo "selftest: jq is required" >&2; exit 1; }
+
+W=$(mktemp -d "${TMPDIR:-/tmp}/cu-selftest.XXXXXX") || exit 1
+trap 'rm -rf "$W"' EXIT
+mkdir -p "$W/bin" "$W/fix" "$W/p" "$W/cache/claude-usage" "$W/home" "$W/tmp"
+# every run gets this temp dir, so the cleanup check at the end sees only this
+# suite's runs, not a claude-usage left open in another terminal
+export TMPDIR="$W/tmp"
+
+printf -v NOW '%(%s)T' -1
+
+# iso <epoch> [fraction] [offset seconds] - the API's own shape:
+# 2026-09-25T06:09:59.721279+00:00, written as wall time in that offset
+iso() {
+  local t=$1 frac=${2:-} off=${3:-0} s sign=+ z
+  s=$(jq -nr --argjson t $(( t + off )) '$t | todate')
+  [ "$off" -lt 0 ] && { sign=-; off=$(( -off )); }
+  printf -v z '%s%02d:%02d' "$sign" $(( off / 3600 )) $(( off % 3600 / 60 ))
+  printf '%s%s%s' "${s%Z}" "$frac" "$z"
+}
+hm() { printf '%(%H:%M)T' "$1"; }
+
+# ---------------------------------------------------------------- stub ----
+cat > "$W/bin/curl" << 'STUB'
+#!/usr/bin/env bash
+# stands in for curl: logs its argv and the token the header carried, then
+# answers the way the usage endpoint would for that token
+hdr=$(cat)
+printf '%s\n' "$*" >> "$STUB_ARGV"
+tok=${hdr#Authorization: Bearer }
+tok=${tok%%[[:space:]]*}
+printf '%s\n' "$tok" >> "$STUB_TOKENS"
+out=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = -o ]; then out=$2; shift; fi
+  shift
+done
+case $tok in
+  tok-alpha|tok-max|tok-empty) cp "$STUB_FIX/$tok.json" "$out"; printf 200 ;;
+  tok-rejected) printf '{"error":{"type":"authentication_error"}}' > "$out"; printf 401 ;;
+  tok-limited)  printf '{"error":{"type":"rate_limit_error"}}' > "$out"; printf 429 ;;
+  tok-garbage)  printf '<html>oops</html>' > "$out"; printf 200 ;;
+  tok-offline)  echo 'curl: (7) Failed to connect' >&2; exit 7 ;;
+  *)            echo "stub: unknown token" >&2; exit 99 ;;
+esac
+STUB
+chmod +x "$W/bin/curl"
+export STUB_ARGV="$W/argv.log" STUB_TOKENS="$W/tokens.log" STUB_FIX="$W/fix"
+: > "$STUB_ARGV"; : > "$STUB_TOKENS"
+
+# ------------------------------------------------------------ fixtures ----
+# 5h resets on a minute boundary about 1h30m out, but the API reports it
+# 0.28s early; the display must round up to the boundary, not show a minute
+# early. 7d is written in +08:00, 1d4h30m out: ignoring the offset would read
+# as 1d12h.
+T5=$(( (NOW / 60 + 91) * 60 ))
+T7=$(( NOW + 102600 ))
+jq -n --arg r5 "$(iso $(( T5 - 1 )) .721279)" --arg r7 "$(iso "$T7" .5 28800)" '{
+  five_hour: {utilization: 45.0, resets_at: $r5},
+  seven_day: {utilization: 79.6, resets_at: $r7},
+  seven_day_opus: null, seven_day_sonnet: null, extra_usage: {is_enabled: false}
+}' > "$W/fix/tok-alpha.json"
+jq -n --arg r5 "$(iso $(( NOW + 600 )))" --arg r7 "$(iso $(( NOW + 300000 )))" '{
+  five_hour: {utilization: 92.0, resets_at: $r5},
+  seven_day: {utilization: 12.0, resets_at: $r7},
+  seven_day_sonnet: {utilization: 30.0, resets_at: $r7}
+}' > "$W/fix/tok-max.json"
+printf '{}' > "$W/fix/tok-empty.json"
+
+# mkprofile <name> <token or -> <expires in seconds> [plan] [tier]
+mkprofile() {
+  local d="$W/p/.claude-$1"
+  mkdir -p "$d"
+  jq -n --arg e "$1@example.com" --arg u "uuid-$1" \
+    '{oauthAccount: {emailAddress: $e, accountUuid: $u}}' > "$d/.claude.json"
+  [ "$2" = - ] && return 0
+  jq -n --arg t "$2" --argjson x $(( (NOW + $3) * 1000 )) --arg s "${4:-pro}" --arg r "${5:-default_claude_ai}" \
+    '{claudeAiOauth: {accessToken: $t, refreshToken: "refresh-secret", expiresAt: $x,
+      subscriptionType: $s, rateLimitTier: $r}}' > "$d/.credentials.json"
+}
+mkprofile alpha    tok-alpha    3600
+mkprofile max      tok-max      3600 max default_claude_max_20x
+mkprofile expired  tok-expired  -7200
+mkprofile rejected tok-rejected 3600
+mkprofile limited  tok-limited  3600
+mkprofile garbage  tok-garbage  3600
+mkprofile offline  tok-offline  3600
+mkprofile empty    tok-empty    3600
+mkprofile nologin  -            0
+
+# seed <name> <line> - a last reading, as an earlier run would have left it
+# key <dir> - the cache file name claude-usage uses: readable, plus a cksum
+key() {
+  local s=${1//[^A-Za-z0-9._-]/_} c
+  c=$(printf '%s' "$1" | cksum)
+  [ "${#s}" -gt 100 ] && s=${s: -100}
+  printf '%s-%s' "$s" "${c%% *}"
+}
+# acct <uuid> - how the cache names an account: a cksum of its id
+acct() { local c; c=$(printf '%s' "$1" | cksum); printf '%s' "${c%% *}"; }
+# seed <name> "<read at> <readings...>" - as an earlier run for that profile's
+# account would have left it
+seed() {
+  printf '%s %s %s\n' "${2%% *}" "$(acct "uuid-$1")" "${2#* }" \
+    > "$W/cache/claude-usage/$(key "$W/p/.claude-$1")"
+}
+# expired: read 3h ago; its 5h window has reset since, its 7d has not
+seed expired "$(( NOW - 10800 )) 80 $(( NOW - 600 )) 55 $(( NOW + 172800 )) -1 -1 -1 -1"
+seed limited "$(( NOW - 120 )) 30 $(( NOW + 3000 )) 40 $(( NOW + 400000 )) -1 -1 -1 -1"
+
+DIRS=""
+for n in alpha max expired rejected limited garbage offline empty nologin; do DIRS+="$W/p/.claude-$n:"; done
+
+# runin <dirs> <args...> - claude-usage against the stub, watching these dirs
+runin() { local d=$1; shift; PATH="$W/bin:$PATH" HOME="$W/home" XDG_CACHE_HOME="$W/cache" CLAUDE_USAGE_DIRS="$d" "$CU" "$@"; }
+run() { runin "$DIRS" "$@"; }
+
+# ------------------------------------------------------------- commands ----
+group "commands"
+ok      "version"                         "$CU" version
+ok      "help"                            "$CU" help
+rejects "unknown command"                 "$CU" frobnicate
+rejects "interval that is not a number"   run watch soon
+rejects "interval under the minimum"      run watch 5
+
+# ------------------------------------------------------------ discovery ----
+group "discovery"
+H="$W/disc"
+mkdir -p "$H/.claude-a" "$H/.claude-b" "$H/.claude-unused" "$H/.claude"
+printf '{}' > "$H/.claude-a/.claude.json"
+printf '{}' > "$H/.claude-b/.credentials.json"
+printf '{}' > "$H/.claude/.claude.json"
+out=$(HOME="$H" PATH="$W/bin:$PATH" "$CU" profiles)
+# the ~ below is what the screen shows, so it stays literal
+# shellcheck disable=SC2088
+has   "finds ~/.claude-a"                          "$out" "~/.claude-a"
+# shellcheck disable=SC2088
+has   "finds ~/.claude-b"                          "$out" "~/.claude-b"
+lacks "skips a dir Claude Code never used"         "$out" "unused"
+lacks "leaves ~/.claude out when profiles exist"   "$out" "DEFAULT"
+rm -rf "$H/.claude-a" "$H/.claude-b"
+out=$(HOME="$H" PATH="$W/bin:$PATH" "$CU" profiles)
+has   "falls back to ~/.claude"                    "$out" "DEFAULT"
+# an unexpanded ~ is the point: the script must expand it itself
+# shellcheck disable=SC2088
+out=$(HOME="$W/p" PATH="$W/bin:$PATH" CLAUDE_USAGE_DIRS="~/.claude-alpha" "$CU" profiles)
+has   "CLAUDE_USAGE_DIRS expands ~"                "$out" "ALPHA"
+has   "profiles shows a valid login"               "$out" "valid until"
+lacks "CLAUDE_USAGE_DIRS limits the list"          "$out" "MAX"
+rejects "no profiles at all is an error"  env HOME="$W/nowhere" PATH="$W/bin:$PATH" "$CU" once
+
+# -------------------------------------------------------------- reading ----
+group "reading usage"
+out=$(run once); rc=$?
+if [ "$rc" = 0 ]; then pass "once exits 0 with failing profiles in it"; else fail "once exited $rc"; fi
+alpha=$(block_of "$out" ALPHA)
+has   "5h percent"                                 "$alpha" " 45%"
+has   "7d percent is floored like /usage"          "$alpha" " 79%"
+has   "shows the email's user part"                "$alpha" "ALPHA  alpha  pro"
+lacks "never the whole address"                    "$out"   "@example.com"
+has   "5h countdown"                               "$alpha" "in 1h"
+has   "reset rounds .72s up to the minute"         "$alpha" "$(hm "$T5")"
+lacks "and not a minute early"                     "$alpha" "$(hm $(( T5 - 60 )))"
+has   "offset in resets_at is applied"             "$alpha" "in 1d4h"
+has   "pace marker drawn"                          "$alpha" "|"
+maxb=$(block_of "$out" MAX)
+has   "max plan names its tier"                    "$maxb" "max 20x"
+has   "7d sonnet row when the plan has one"        "$maxb" "7d sonnet"
+has   "sonnet percent"                             "$maxb" " 30%"
+has   "empty answer says so"                       "$(block_of "$out" EMPTY)" "no usage limits reported"
+
+# ------------------------------------------------------------- failures ----
+group "failures keep the last reading"
+exp=$(block_of "$out" EXPIRED)
+has   "expired login is named"                     "$exp" "login expired 2h ago"
+has   "and says how to renew it"                   "$exp" "open Claude Code with"
+has   "shows the cached reading's age"             "$exp" "(3h ago)"
+has   "a window that reset since reads 0%"         "$exp" "  0%  reset at"
+has   "the 7d window keeps its number"             "$exp" " 55%"
+has   "401 is a rejected login"                    "$(block_of "$out" REJECTED)" "login rejected (401)"
+lim=$(block_of "$out" LIMITED)
+has   "429 is rate limited"                        "$lim" "rate limited"
+has   "and keeps its cached 5h"                    "$lim" " 30%"
+has   "non-JSON answer"                            "$(block_of "$out" GARBAGE)" "unexpected answer"
+has   "curl exit 7 is offline"                     "$(block_of "$out" OFFLINE)" "offline"
+has   "no credentials is not logged in"            "$(block_of "$out" NOLOGIN)" "not logged in"
+
+# --------------------------------------------------------------- secret ----
+group "the login stays secret"
+tokens=$(cat "$STUB_TOKENS")
+has   "token reaches curl in the header"           "$tokens" "tok-alpha"
+lacks "expired login is never sent"                "$tokens" "tok-expired"
+argv=$(cat "$STUB_ARGV")
+lacks "no token on curl's command line"            "$argv" "tok-"
+has   "asks with the oauth beta header"            "$argv" "anthropic-beta: oauth-2025-04-20"
+lacks "no token on screen"                         "$out" "tok-"
+cache=$(cat "$W/cache/claude-usage/"*)
+lacks "no token in the cache"                      "$cache" "tok-"
+lacks "no refresh token in the cache"              "$cache" "refresh-secret"
+if printf '%s\n' "$cache" | grep -qvE '^[0-9]+ [0-9]+( -?[0-9]+){8}$'; then
+  fail "cache holds numbers only"
+else
+  pass "cache holds numbers only"
+fi
+# ---------------------------------------------------------------- cache ----
+group "cache"
+has   "a good reading is cached"                   "$cache" " 45 "
+# alpha goes offline: the next run must still show its last reading
+jq '.claudeAiOauth.accessToken = "tok-offline"' "$W/p/.claude-alpha/.credentials.json" > "$W/c.json" &&
+  mv "$W/c.json" "$W/p/.claude-alpha/.credentials.json"
+alpha=$(block_of "$(run once)" ALPHA)
+has   "offline profile shows the cached 45%"       "$alpha" " 45%"
+has   "and marks it as old"                        "$alpha" "as of"
+# two dirs that flatten to one name must each keep their own cache
+mkprofile 'team#one' tok-max     3600
+mkprofile 'team@one' tok-expired -7200
+TWO="$W/p/.claude-team#one:$W/p/.claude-team@one"
+runin "$TWO" once > /dev/null
+second=$(block_of "$(runin "$TWO" once)" 'TEAM@ONE')
+lacks "a profile never shows another's cached numbers" "$second" "92%"
+has   "and says it has nothing of its own"         "$second" "login expired"
+# alpha's dir is logged out and into bob, whose first read fails: alpha's
+# cached 45% must not appear under bob's name
+jq -n '{oauthAccount: {emailAddress: "bob@example.com", accountUuid: "uuid-bob"}}' \
+  > "$W/p/.claude-alpha/.claude.json"
+alpha=$(block_of "$(run once)" ALPHA)
+has   "an account switch shows the new name"       "$alpha" "ALPHA  bob"
+lacks "and not the old account's reading"          "$alpha" " 45%"
+has   "only the reason it has none"                "$alpha" "offline"
+# a line from before readings carried their account is dropped, not shown
+mkprofile legacy tok-offline 3600
+printf '%s\n' "$(( NOW - 60 )) 61 $(( NOW + 3000 )) 62 $(( NOW + 400000 )) -1 -1 -1 -1" \
+  > "$W/cache/claude-usage/$(key "$W/p/.claude-legacy")"
+lacks "an old-format cache line is ignored"        "$(runin "$W/p/.claude-legacy" once)" "61%"
+
+# ---------------------------------------------------------------- output ----
+group "output"
+esc=$'\033'
+lacks "NO_COLOR output has no escapes"             "$out" "$esc"
+out=$(run | cat); rc=$?
+if [ "$rc" = 0 ]; then pass "piped with no command: one snapshot"; else fail "piped run exited $rc"; fi
+has   "and it is the report"                       "$out" "CLAUDE USAGE"
+out=$(run watch 60 | cat)
+has   "watch without a terminal falls back to once" "$out" "CLAUDE USAGE"
+
+# ------------------------------------------------------------- keychain ----
+# A stand-in Mac: uname says Darwin, and security answers from a directory of
+# items named the way Claude Code names them. No profile here has a
+# .credentials.json, so every login comes through the Keychain path.
+group "macOS Keychain"
+mkdir -p "$W/macbin" "$W/keychain" "$W/mac/.claude" "$W/macw/.claude-work"
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$W/macbin/uname"
+cat > "$W/macbin/security" << 'STUB'
+#!/usr/bin/env bash
+svc=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = -s ]; then svc=$2; shift; fi
+  shift
+done
+[ -f "$KEYCHAIN/$svc" ] || { echo "security: item not found" >&2; exit 44; }
+cat "$KEYCHAIN/$svc"
+STUB
+chmod +x "$W/macbin/uname" "$W/macbin/security"
+export KEYCHAIN="$W/keychain"
+item() {
+  jq -n --arg t "$2" --argjson x $(( (NOW + 3600) * 1000 )) \
+    '{claudeAiOauth: {accessToken: $t, expiresAt: $x, subscriptionType: "pro"}}' > "$KEYCHAIN/$1"
+}
+hashed() { local h; h=$(printf '%s' "$1" | shasum -a 256); printf 'Claude Code-credentials-%s' "${h:0:8}"; }
+printf '{}' > "$W/mac/.claude/.claude.json"
+printf '{}' > "$W/macw/.claude-work/.claude.json"
+# a fresh cache per run, so a cached reading can never stand in for a failed one
+mac() { PATH="$W/macbin:$W/bin:$PATH" HOME="$W/mac" XDG_CACHE_HOME="$(mktemp -d "$W/mc.XXXXXX")" "$@"; }
+
+item "Claude Code-credentials" tok-max                       # 92%
+item "$(hashed "$W/macw/.claude-work")" tok-alpha            # 45%
+out=$(mac env CLAUDE_USAGE_DIRS="$W/macw/.claude-work" "$CU" once)
+has   "a profile reads its hashed item"            "$out" " 45%"
+lacks "never the default profile's item"           "$out" " 92%"
+has   "the default ~/.claude, found by discovery, reads the plain item" \
+  "$(mac env -u CLAUDE_USAGE_DIRS "$CU" once)" " 92%"
+has   "the default ~/.claude named in CLAUDE_USAGE_DIRS reads it too" \
+  "$(mac env CLAUDE_USAGE_DIRS="$W/mac/.claude" "$CU" once)" " 92%"
+rm "$KEYCHAIN/Claude Code-credentials"
+item "$(hashed "$W/mac/.claude")" tok-alpha
+has   "the default ~/.claude opened with CLAUDE_CONFIG_DIR uses its hashed item" \
+  "$(mac env CLAUDE_USAGE_DIRS="$W/mac/.claude" "$CU" once)" " 45%"
+
+# -------------------------------------------------------------- terminal ----
+group "in a terminal"
+if [ "$(uname -s)" = Linux ] && command -v script > /dev/null; then
+  # tty_once <NO_COLOR value> - one snapshot as a UTF-8 terminal gets it
+  tty_once() {
+    script -qc "stty cols 80; env NO_COLOR='$1' LANG=C.UTF-8 TERM=xterm PATH='$W/bin:$PATH' HOME='$W/home' XDG_CACHE_HOME='$W/cache' CLAUDE_USAGE_DIRS='$W/p/.claude-max' '$CU' once" /dev/null
+  }
+  out=$(tty_once 1)
+  has   "NO_COLOR keeps the block glyphs"          "$out" "█"
+  lacks "and turns colour off"                     "$out" $'\033['
+  has   "without it there is colour"               "$(tty_once "")" $'\033['
+else
+  printf '  skip  terminal checks (Linux with script(1) only)\n'
+fi
+
+# ------------------------------------------------------------------ bump ----
+# In a scratch repo built from the working tree, so what runs is the bump on
+# disk, not the last commit. Local config keeps your signing and hooks out.
+group "bump"
+B="$W/bump"
+mkdir -p "$B/scripts" "$B/.nohooks"
+cp "$CU" "$B/claude-usage"; cp scripts/bump "$B/scripts/bump"
+if ( cd "$B" && git init -q && git config user.name selftest &&
+     git config user.email selftest@example.com && git config commit.gpgsign false &&
+     git config tag.gpgsign false && git config core.hooksPath .nohooks &&
+     git add claude-usage scripts && git commit -q -m init ) > /dev/null 2>&1; then
+  printf 'my own backup\n' > "$B/claude-usage.bak"
+  ok    "bump commits and tags"                    "$B/scripts/bump" patch
+  has   "an untracked claude-usage.bak survives"   "$(cat "$B/claude-usage.bak" 2> /dev/null)" "my own backup"
+  lacks "bump removes its own backup"             "$(ls -A "$B")" "claude-usage.bump-"
+  has   "and the tag is there"                     "$(git -C "$B" tag)" "v"
+else
+  fail "could not make a scratch repo for bump"
+fi
+
+group "scripts parse"
+ok "claude-usage" bash -n "$CU"
+ok "bump"         bash -n scripts/bump
+
+group "cleanup"
+leftover=$(ls -A "$TMPDIR")
+if [ -z "$leftover" ]; then pass "every run removed its temp dir"; else fail "left behind in TMPDIR: $leftover"; fi
+
+printf '\n'
+if [ "$fails" -gt 0 ]; then
+  printf '%d check(s) failed\n' "$fails" >&2
+  exit 1
+fi
+printf 'all checks passed\n'

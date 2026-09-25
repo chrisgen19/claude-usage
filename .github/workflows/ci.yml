@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck --version
+
+      - name: shellcheck
+        run: shellcheck --severity=style --format=gcc claude-usage scripts/bump scripts/selftest
+
+      - name: Parse check
+        run: |
+          bash -n claude-usage
+          bash -n scripts/bump
+          bash -n scripts/selftest
+
+      - name: Executable bit is committed
+        run: |
+          mode=$(git ls-files -s claude-usage | awk '{print $1}')
+          echo "mode=$mode"
+          if [ "$mode" != "100755" ]; then
+            echo "::error::claude-usage must be committed executable (100755), found $mode"
+            exit 1
+          fi
+
+  smoke:
+    name: self test
+    runs-on: ubuntu-latest
+    env:
+      NO_COLOR: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self test
+        run: ./scripts/selftest
+
+  smoke-macos:
+    name: self test (macOS)
+    runs-on: macos-latest
+    env:
+      NO_COLOR: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # macOS ships bash 3.2, which has no printf %(...)T, mapfile or ${x^^}.
+      - name: Install bash 5 and jq
+        run: |
+          brew install bash jq
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+
+      - name: Bash version in use
+        run: |
+          which -a bash
+          bash --version | head -1
+
+      - name: Self test
+        run: ./scripts/selftest
