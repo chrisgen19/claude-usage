@@ -79,12 +79,13 @@ ln -s "$PWD/claude-usage/claude-usage" ~/.local/bin/claude-usage
 | Command | What it does |
 | --- | --- |
 | `claude-usage` | Live view in a terminal; one snapshot when piped |
-| `claude-usage watch [secs]` | Live view, refreshing every `secs` (default 60, at least 30) |
+| `claude-usage watch [secs]` | Live view, refreshing every `secs` (default 60, at least 60) |
 | `claude-usage once` | Print one snapshot and exit |
 | `claude-usage profiles` | The profiles found and whether each login is still valid. No network |
 | `claude-usage help` | All of the above |
 
-Keys in the live view: `r` refreshes now (at most every 15s), `q` quits.
+Keys in the live view: `r` refreshes now, `q` quits. `r` keeps to the rate
+limit below, so an account read under a minute ago is not asked again.
 
 ## Reading it
 
@@ -129,8 +130,15 @@ The self test asserts all three.
 - **The usage endpoint is not a public API.** It is what Claude Code's own
   `/usage` calls, and it could change without notice. If it does, profiles show
   `unexpected answer from the usage endpoint` rather than wrong numbers.
-- **It is rate-limited.** That is why the live view refreshes every 60 seconds
-  by default and refuses anything under 30.
+- **It is rate-limited,** to about one read a minute per account; a second one
+  gets a 429. So a reading under a minute old, taken by any `claude-usage` on
+  this machine, is reused instead of asked for again, which lets a live view
+  and a `once` run, or two live views, share the minute. After a 429 that
+  account waits 2 minutes, then 4, then 5, and the wait is kept beside the
+  cache so every `claude-usage` here keeps to it. The endpoint does send
+  `retry-after`, but has said `0` and then refused the retry, so it only
+  counts when it asks for longer. A copy on another machine cannot see any of
+  this, so it may still collide; the wait is what keeps that from repeating.
 - **macOS reads the Keychain.** Claude Code 2.1 names the item for how it was
   started: `Claude Code-credentials` with `CLAUDE_CONFIG_DIR` unset, otherwise
   that plus `-` and the first 8 hex characters of `sha256(CLAUDE_CONFIG_DIR)`.

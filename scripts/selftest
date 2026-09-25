@@ -81,16 +81,28 @@ printf '%s\n' "$*" >> "$STUB_ARGV"
 tok=${hdr#Authorization: Bearer }
 tok=${tok%%[[:space:]]*}
 printf '%s\n' "$tok" >> "$STUB_TOKENS"
-out=""
+out=""; hdrs=""
 while [ $# -gt 0 ]; do
-  if [ "$1" = -o ]; then out=$2; shift; fi
+  case $1 in
+    -o) out=$2; shift ;;
+    -D) hdrs=$2; shift ;;
+  esac
   shift
 done
+# answer <code> [retry-after] - the headers curl -D saves, and the code -w prints
+answer() {
+  { printf 'HTTP/2 %s\r\n' "$1"
+    [ -n "${2:-}" ] && printf 'retry-after: %s\r\n' "$2"
+    printf '\r\n'; } > "${hdrs:-/dev/null}"
+  printf '%s' "$1"
+}
 case $tok in
-  tok-alpha|tok-max|tok-empty) cp "$STUB_FIX/$tok.json" "$out"; printf 200 ;;
-  tok-rejected) printf '{"error":{"type":"authentication_error"}}' > "$out"; printf 401 ;;
-  tok-limited)  printf '{"error":{"type":"rate_limit_error"}}' > "$out"; printf 429 ;;
-  tok-garbage)  printf '<html>oops</html>' > "$out"; printf 200 ;;
+  tok-alpha|tok-max|tok-empty) cp "$STUB_FIX/$tok.json" "$out"; answer 200 ;;
+  tok-rejected) printf '{"error":{"type":"authentication_error"}}' > "$out"; answer 401 ;;
+  # the real endpoint says retry-after: 0 and then refuses the retry
+  tok-limited)  printf '{"error":{"type":"rate_limit_error"}}' > "$out"; answer 429 0 ;;
+  tok-slow)     printf '{"error":{"type":"rate_limit_error"}}' > "$out"; answer 429 900 ;;
+  tok-garbage)  printf '<html>oops</html>' > "$out"; answer 200 ;;
   tok-offline)  echo 'curl: (7) Failed to connect' >&2; exit 7 ;;
   *)            echo "stub: unknown token" >&2; exit 99 ;;
 esac
@@ -151,6 +163,14 @@ key() {
 acct() { local c; c=$(printf '%s' "$1" | cksum); printf '%s' "${c%% *}"; }
 # seed <name> "<read at> <readings...>" - as an earlier run for that profile's
 # account would have left it
+# stamp <name> <epoch> - move a profile's cached reading to that time
+stamp() {
+  local f rest
+  f="$W/cache/claude-usage/$(key "$W/p/.claude-$1")"
+  read -r _ rest < "$f"
+  printf '%s %s\n' "$2" "$rest" > "$f"
+}
+now() { printf '%(%s)T' -1; }
 seed() {
   printf '%s %s %s\n' "${2%% *}" "$(acct "uuid-$1")" "${2#* }" \
     > "$W/cache/claude-usage/$(key "$W/p/.claude-$1")"
@@ -248,15 +268,25 @@ lacks "no token on screen"                         "$out" "tok-"
 cache=$(cat "$W/cache/claude-usage/"*)
 lacks "no token in the cache"                      "$cache" "tok-"
 lacks "no refresh token in the cache"              "$cache" "refresh-secret"
-if printf '%s\n' "$cache" | grep -qvE '^[0-9]+ [0-9]+( -?[0-9]+){8}$'; then
+readings=$(for f in "$W/cache/claude-usage/"*; do case $f in *.retry) ;; *) cat "$f" ;; esac; done)
+if printf '%s\n' "$readings" | grep -qvE '^[0-9]+ [0-9]+( -?[0-9]+){8}$'; then
   fail "cache holds numbers only"
 else
   pass "cache holds numbers only"
 fi
+waits=$(cat "$W/cache/claude-usage/"*.retry)
+if [ -n "$waits" ] && ! printf '%s\n' "$waits" | grep -qvE '^[0-9]+ [0-9]+$'; then
+  pass "a rate-limit wait holds numbers only"
+else
+  fail "a rate-limit wait holds numbers only (got: $waits)"
+fi
 # ---------------------------------------------------------------- cache ----
 group "cache"
 has   "a good reading is cached"                   "$cache" " 45 "
-# alpha goes offline: the next run must still show its last reading
+# alpha goes offline: the next run must still show its last reading. The
+# reading is moved past the minute a reading is reused for, or no request
+# would be made at all.
+stamp alpha $(( $(now) - 120 ))
 jq '.claudeAiOauth.accessToken = "tok-offline"' "$W/p/.claude-alpha/.credentials.json" > "$W/c.json" &&
   mv "$W/c.json" "$W/p/.claude-alpha/.credentials.json"
 alpha=$(block_of "$(run once)" ALPHA)
@@ -271,7 +301,8 @@ second=$(block_of "$(runin "$TWO" once)" 'TEAM@ONE')
 lacks "a profile never shows another's cached numbers" "$second" "92%"
 has   "and says it has nothing of its own"         "$second" "login expired"
 # alpha's dir is logged out and into bob, whose first read fails: alpha's
-# cached 45% must not appear under bob's name
+# cached 45% must not appear under bob's name, even though it is fresh
+stamp alpha "$(now)"
 jq -n '{oauthAccount: {emailAddress: "bob@example.com", accountUuid: "uuid-bob"}}' \
   > "$W/p/.claude-alpha/.claude.json"
 alpha=$(block_of "$(run once)" ALPHA)
@@ -283,6 +314,51 @@ mkprofile legacy tok-offline 3600
 printf '%s\n' "$(( NOW - 60 )) 61 $(( NOW + 3000 )) 62 $(( NOW + 400000 )) -1 -1 -1 -1" \
   > "$W/cache/claude-usage/$(key "$W/p/.claude-legacy")"
 lacks "an old-format cache line is ignored"        "$(runin "$W/p/.claude-legacy" once)" "61%"
+
+# ---------------------------------------------------------- rate limits ----
+group "rate limits"
+retry_file() { printf '%s' "$W/cache/claude-usage/$(key "$W/p/.claude-$1").retry"; }
+set_wait() { printf '%s %s\n' "$2" "$3" > "$(retry_file "$1")"; }
+asks() { grep -c "^$1\$" "$STUB_TOKENS"; }
+# waited <name> <streak> <min> <max> - the saved wait has that streak and ends
+# between min and max seconds from now
+waited() {
+  local ra=0 n=0 t
+  [ -f "$(retry_file "$1")" ] && read -r ra n < "$(retry_file "$1")"
+  t=$(now)
+  [ "$n" = "$2" ] && [ $(( ra - t )) -ge "$3" ] && [ $(( ra - t )) -le "$4" ]
+}
+# limited got its 429, with retry-after: 0, in the first run above
+if waited limited 1 110 125; then pass "a 429 waits 2 minutes, retry-after: 0 or not"
+else fail "a 429 waits 2 minutes (got: $(cat "$(retry_file limited)"), now $(now))"; fi
+before=$(asks tok-limited)
+lim=$(block_of "$(run once)" LIMITED)
+if [ "$(asks tok-limited)" = "$before" ]; then pass "not asked again while it waits"
+else fail "asked again while it waits"; fi
+has   "and says when it will be"                   "$lim" "rate limited: next try in"
+set_wait limited $(( $(now) - 1 )) 1
+run once > /dev/null
+if waited limited 2 235 245; then pass "the next 429 in a row waits 4 minutes"
+else fail "the next 429 in a row waits 4 minutes (got: $(cat "$(retry_file limited)"))"; fi
+set_wait limited $(( $(now) - 1 )) 4
+run once > /dev/null
+if waited limited 5 295 305; then pass "and it stops doubling at 5 minutes"
+else fail "and it stops doubling at 5 minutes (got: $(cat "$(retry_file limited)"))"; fi
+mkprofile slow tok-slow 3600
+runin "$W/p/.claude-slow" once > /dev/null
+if waited slow 1 895 905; then pass "a longer retry-after from the server wins"
+else fail "a longer retry-after from the server wins (got: $(cat "$(retry_file slow)"))"; fi
+stamp max $(( $(now) - 120 ))
+set_wait max $(( $(now) - 1 )) 3
+run once > /dev/null
+if [ -e "$(retry_file max)" ]; then fail "a good reading ends the wait"
+else pass "a good reading ends the wait"; fi
+# max was just read; a second run, a separate process, must reuse it
+before=$(asks tok-max)
+maxb=$(block_of "$(run once)" MAX)
+if [ "$(asks tok-max)" = "$before" ]; then pass "a reading under a minute old is reused, not asked for"
+else fail "a reading under a minute old was asked for again"; fi
+has   "and shows as current"                       "$maxb" "updated"
 
 # ---------------------------------------------------------------- output ----
 group "output"
