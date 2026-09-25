@@ -53,7 +53,10 @@ command -v jq > /dev/null || { echo "selftest: jq is required" >&2; exit 1; }
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/cu-selftest.XXXXXX") || exit 1
 trap 'rm -rf "$W"' EXIT
-mkdir -p "$W/bin" "$W/fix" "$W/p" "$W/cache/claude-usage" "$W/home"
+mkdir -p "$W/bin" "$W/fix" "$W/p" "$W/cache/claude-usage" "$W/home" "$W/tmp"
+# every run gets this temp dir, so the cleanup check at the end sees only this
+# suite's runs, not a claude-usage left open in another terminal
+export TMPDIR="$W/tmp"
 
 printf -v NOW '%(%s)T' -1
 
@@ -136,7 +139,14 @@ mkprofile empty    tok-empty    3600
 mkprofile nologin  -            0
 
 # seed <name> <line> - a last reading, as an earlier run would have left it
-seed() { local k="$W/p/.claude-$1"; printf '%s\n' "$2" > "$W/cache/claude-usage/${k//[^A-Za-z0-9._-]/_}"; }
+# key <dir> - the cache file name claude-usage uses: readable, plus a cksum
+key() {
+  local s=${1//[^A-Za-z0-9._-]/_} c
+  c=$(printf '%s' "$1" | cksum)
+  [ "${#s}" -gt 100 ] && s=${s: -100}
+  printf '%s-%s' "$s" "${c%% *}"
+}
+seed() { printf '%s\n' "$2" > "$W/cache/claude-usage/$(key "$W/p/.claude-$1")"; }
 # expired: read 3h ago; its 5h window has reset since, its 7d has not
 seed expired "$(( NOW - 10800 )) 80 $(( NOW - 600 )) 55 $(( NOW + 172800 )) -1 -1 -1 -1"
 seed limited "$(( NOW - 120 )) 30 $(( NOW + 3000 )) 40 $(( NOW + 400000 )) -1 -1 -1 -1"
@@ -144,7 +154,9 @@ seed limited "$(( NOW - 120 )) 30 $(( NOW + 3000 )) 40 $(( NOW + 400000 )) -1 -1
 DIRS=""
 for n in alpha max expired rejected limited garbage offline empty nologin; do DIRS+="$W/p/.claude-$n:"; done
 
-run() { PATH="$W/bin:$PATH" HOME="$W/home" XDG_CACHE_HOME="$W/cache" CLAUDE_USAGE_DIRS="$DIRS" "$CU" "$@"; }
+# runin <dirs> <args...> - claude-usage against the stub, watching these dirs
+runin() { local d=$1; shift; PATH="$W/bin:$PATH" HOME="$W/home" XDG_CACHE_HOME="$W/cache" CLAUDE_USAGE_DIRS="$d" "$CU" "$@"; }
+run() { runin "$DIRS" "$@"; }
 
 # ------------------------------------------------------------- commands ----
 group "commands"
@@ -233,9 +245,6 @@ if printf '%s\n' "$cache" | grep -qvE '^[0-9]+( -?[0-9]+){8}$'; then
 else
   pass "cache holds numbers only"
 fi
-leftover=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'claude-usage.*' -newer "$STUB_FIX/tok-empty.json" 2> /dev/null)
-if [ -z "$leftover" ]; then pass "temp dir removed on exit"; else fail "temp dir left behind: $leftover"; fi
-
 # ---------------------------------------------------------------- cache ----
 group "cache"
 has   "a good reading is cached"                   "$cache" " 45 "
@@ -245,6 +254,14 @@ jq '.claudeAiOauth.accessToken = "tok-offline"' "$W/p/.claude-alpha/.credentials
 alpha=$(block_of "$(run once)" ALPHA)
 has   "offline profile shows the cached 45%"       "$alpha" " 45%"
 has   "and marks it as old"                        "$alpha" "as of"
+# two dirs that flatten to one name must each keep their own cache
+mkprofile 'team#one' tok-max     3600
+mkprofile 'team@one' tok-expired -7200
+TWO="$W/p/.claude-team#one:$W/p/.claude-team@one"
+runin "$TWO" once > /dev/null
+second=$(block_of "$(runin "$TWO" once)" 'TEAM@ONE')
+lacks "a profile never shows another's cached numbers" "$second" "92%"
+has   "and says it has nothing of its own"         "$second" "login expired"
 
 # ---------------------------------------------------------------- output ----
 group "output"
@@ -256,9 +273,33 @@ has   "and it is the report"                       "$out" "CLAUDE USAGE"
 out=$(run watch 60 | cat)
 has   "watch without a terminal falls back to once" "$out" "CLAUDE USAGE"
 
+# ------------------------------------------------------------------ bump ----
+# In a scratch repo built from the working tree, so what runs is the bump on
+# disk, not the last commit. Local config keeps your signing and hooks out.
+group "bump"
+B="$W/bump"
+mkdir -p "$B/scripts" "$B/.nohooks"
+cp "$CU" "$B/claude-usage"; cp scripts/bump "$B/scripts/bump"
+if ( cd "$B" && git init -q && git config user.name selftest &&
+     git config user.email selftest@example.com && git config commit.gpgsign false &&
+     git config tag.gpgsign false && git config core.hooksPath .nohooks &&
+     git add claude-usage scripts && git commit -q -m init ) > /dev/null 2>&1; then
+  printf 'my own backup\n' > "$B/claude-usage.bak"
+  ok    "bump commits and tags"                    "$B/scripts/bump" patch
+  has   "an untracked claude-usage.bak survives"   "$(cat "$B/claude-usage.bak" 2> /dev/null)" "my own backup"
+  lacks "bump removes its own backup"             "$(ls -A "$B")" "claude-usage.bump-"
+  has   "and the tag is there"                     "$(git -C "$B" tag)" "v"
+else
+  fail "could not make a scratch repo for bump"
+fi
+
 group "scripts parse"
 ok "claude-usage" bash -n "$CU"
 ok "bump"         bash -n scripts/bump
+
+group "cleanup"
+leftover=$(ls -A "$TMPDIR")
+if [ -z "$leftover" ]; then pass "every run removed its temp dir"; else fail "left behind in TMPDIR: $leftover"; fi
 
 printf '\n'
 if [ "$fails" -gt 0 ]; then

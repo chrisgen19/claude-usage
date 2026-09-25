@@ -114,13 +114,25 @@ P_NOTE=()    # why a profile is not fresh, shown under its name
 P_AT=()      # epoch the shown numbers were read, 0 for never
 P_DATA=()    # "5h% 5h-reset 7d% 7d-reset opus% opus-reset sonnet% sonnet-reset", -1 = absent
 
+# cache_key <dir> - the dir's cache file name: readable, plus a checksum of the
+# exact path. Flattening alone maps ~/.claude-a b and ~/.claude-a_b to one file,
+# and then one profile shows the other's numbers. cksum is POSIX, so Linux and
+# macOS name the file the same way.
+cache_key() {
+  local sum safe=${1//[^A-Za-z0-9._-]/_}
+  sum=$(printf '%s' "$1" | cksum) || sum=0
+  [ "${#safe}" -gt 100 ] && safe=${safe: -100}
+  REPLY="${safe}-${sum%% *}"
+}
+
 add_profile() {
   local dir=${1%/} i=${#P_DIR[@]} b
   b=${dir##*/}; b=${b#.}; b=${b#claude-}
   [ "$b" = claude ] && b=default
+  cache_key "$dir"
   P_DIR+=("$dir")
   P_SHORT+=("${dir/#"$HOME"/\~}")
-  P_KEY+=("${dir//[^A-Za-z0-9._-]/_}")
+  P_KEY+=("$REPLY")
   P_LABEL+=("${b^^}")
   # common profile names keep one colour everywhere; the rest take turns
   case ${b^^} in
