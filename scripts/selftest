@@ -98,6 +98,15 @@ answer() {
 }
 case $tok in
   tok-alpha|tok-max|tok-empty) cp "$STUB_FIX/$tok.json" "$out"; answer 200 ;;
+  tok-twin*|tok-switcher)      cp "$STUB_FIX/tok-alpha.json" "$out"; answer 200 ;;
+  # the real limit: the first caller is answered, a second at the same moment
+  # gets a 429
+  tok-race)
+    if mkdir "$STUB_RACE" 2> /dev/null; then
+      sleep 0.5; cp "$STUB_FIX/tok-alpha.json" "$out"; answer 200
+    else
+      printf '{"error":{"type":"rate_limit_error"}}' > "$out"; answer 429 0
+    fi ;;
   tok-rejected) printf '{"error":{"type":"authentication_error"}}' > "$out"; answer 401 ;;
   # the real endpoint says retry-after: 0 and then refuses the retry
   tok-limited)  printf '{"error":{"type":"rate_limit_error"}}' > "$out"; answer 429 0 ;;
@@ -108,7 +117,7 @@ case $tok in
 esac
 STUB
 chmod +x "$W/bin/curl"
-export STUB_ARGV="$W/argv.log" STUB_TOKENS="$W/tokens.log" STUB_FIX="$W/fix"
+export STUB_ARGV="$W/argv.log" STUB_TOKENS="$W/tokens.log" STUB_FIX="$W/fix" STUB_RACE="$W/race.lock"
 : > "$STUB_ARGV"; : > "$STUB_TOKENS"
 
 # ------------------------------------------------------------ fixtures ----
@@ -134,8 +143,8 @@ printf '{}' > "$W/fix/tok-empty.json"
 mkprofile() {
   local d="$W/p/.claude-$1"
   mkdir -p "$d"
-  jq -n --arg e "$1@example.com" --arg u "uuid-$1" \
-    '{oauthAccount: {emailAddress: $e, accountUuid: $u}}' > "$d/.claude.json"
+  jq -n --arg e "$1@example.com" --arg u "uuid-$1" --arg o "org-$1" \
+    '{oauthAccount: {emailAddress: $e, accountUuid: $u, organizationUuid: $o}}' > "$d/.claude.json"
   [ "$2" = - ] && return 0
   jq -n --arg t "$2" --argjson x $(( (NOW + $3) * 1000 )) --arg s "${4:-pro}" --arg r "${5:-default_claude_ai}" \
     '{claudeAiOauth: {accessToken: $t, refreshToken: "refresh-secret", expiresAt: $x,
@@ -151,30 +160,44 @@ mkprofile offline  tok-offline  3600
 mkprofile empty    tok-empty    3600
 mkprofile nologin  -            0
 
-# seed <name> <line> - a last reading, as an earlier run would have left it
-# key <dir> - the cache file name claude-usage uses: readable, plus a cksum
+# key <dir> - the cache file name for a dir with no account on record:
+# readable, plus a cksum of the path
 key() {
   local s=${1//[^A-Za-z0-9._-]/_} c
   c=$(printf '%s' "$1" | cksum)
   [ "${#s}" -gt 100 ] && s=${s: -100}
   printf '%s-%s' "$s" "${c%% *}"
 }
-# acct <uuid> - how the cache names an account: a cksum of its id
-acct() { local c; c=$(printf '%s' "$1" | cksum); printf '%s' "${c%% *}"; }
+# acct <name> - how a reading names what it was read for: a cksum of the
+# profile's account and organisation
+acct() { local c; c=$(printf '%s' "uuid-$1/org-$1" | cksum); printf '%s' "${c%% *}"; }
+# cachefile <name> - where a profile's reading lives: under its account and
+# organisation, through cksum when the ids are not plain
+cachefile() {
+  local c
+  if [[ "uuid-$1-org-$1" =~ ^[A-Za-z0-9-]+$ ]]; then
+    printf '%s' "$W/cache/claude-usage/acct-uuid-$1-org-$1"
+  else
+    c=$(printf '%s' "uuid-$1/org-$1" | cksum)
+    printf '%s' "$W/cache/claude-usage/acct-${c%% *}"
+  fi
+}
+# stampf <file> <epoch> / stamp <name> <epoch> - move a cached reading to then
+# A missing file fails the check it was for rather than stopping the suite,
+# so a regression shows every check it breaks, not just the first.
+stampf() {
+  local rest=""
+  if [ -f "$1" ] && read -r _ rest < "$1"; then
+    printf '%s %s\n' "$2" "$rest" > "$1"
+  else
+    fail "no cached reading at ${1##*/} to move"
+  fi
+}
+stamp() { stampf "$(cachefile "$1")" "$2"; }
+now() { printf '%(%s)T' -1; }
 # seed <name> "<read at> <readings...>" - as an earlier run for that profile's
 # account would have left it
-# stamp <name> <epoch> - move a profile's cached reading to that time
-stamp() {
-  local f rest
-  f="$W/cache/claude-usage/$(key "$W/p/.claude-$1")"
-  read -r _ rest < "$f"
-  printf '%s %s\n' "$2" "$rest" > "$f"
-}
-now() { printf '%(%s)T' -1; }
-seed() {
-  printf '%s %s %s\n' "${2%% *}" "$(acct "uuid-$1")" "${2#* }" \
-    > "$W/cache/claude-usage/$(key "$W/p/.claude-$1")"
-}
+seed() { printf '%s %s %s\n' "${2%% *}" "$(acct "$1")" "${2#* }" > "$(cachefile "$1")"; }
 # expired: read 3h ago; its 5h window has reset since, its 7d has not
 seed expired "$(( NOW - 10800 )) 80 $(( NOW - 600 )) 55 $(( NOW + 172800 )) -1 -1 -1 -1"
 seed limited "$(( NOW - 120 )) 30 $(( NOW + 3000 )) 40 $(( NOW + 400000 )) -1 -1 -1 -1"
@@ -292,9 +315,13 @@ jq '.claudeAiOauth.accessToken = "tok-offline"' "$W/p/.claude-alpha/.credentials
 alpha=$(block_of "$(run once)" ALPHA)
 has   "offline profile shows the cached 45%"       "$alpha" " 45%"
 has   "and marks it as old"                        "$alpha" "as of"
-# two dirs that flatten to one name must each keep their own cache
+# two dirs that flatten to one name must each keep their own cache. With no
+# account on record, this is the one case still keyed by dir.
 mkprofile 'team#one' tok-max     3600
 mkprofile 'team@one' tok-expired -7200
+for t in 'team#one' 'team@one'; do
+  jq -n --arg e "$t@example.com" '{oauthAccount: {emailAddress: $e}}' > "$W/p/.claude-$t/.claude.json"
+done
 TWO="$W/p/.claude-team#one:$W/p/.claude-team@one"
 runin "$TWO" once > /dev/null
 second=$(block_of "$(runin "$TWO" once)" 'TEAM@ONE')
@@ -312,12 +339,22 @@ has   "only the reason it has none"                "$alpha" "offline"
 # a line from before readings carried their account is dropped, not shown
 mkprofile legacy tok-offline 3600
 printf '%s\n' "$(( NOW - 60 )) 61 $(( NOW + 3000 )) 62 $(( NOW + 400000 )) -1 -1 -1 -1" \
-  > "$W/cache/claude-usage/$(key "$W/p/.claude-legacy")"
+  > "$(cachefile legacy)"
 lacks "an old-format cache line is ignored"        "$(runin "$W/p/.claude-legacy" once)" "61%"
+# a dir with no account id is keyed by its path, so only the reading's own
+# account mark stops it showing the last login's numbers after a switch
+mkprofile noid tok-offline 3600
+jq -n '{oauthAccount: {emailAddress: "first@example.com"}}' > "$W/p/.claude-noid/.claude.json"
+c=$(printf '%s' "first@example.com/" | cksum)
+printf '%s %s %s\n' "$(( $(now) - 120 ))" "${c%% *}" "63 $(( NOW + 3000 )) 64 $(( NOW + 400000 )) -1 -1 -1 -1" \
+  > "$W/cache/claude-usage/$(key "$W/p/.claude-noid")"
+has   "a dir with no account id keeps its reading"  "$(runin "$W/p/.claude-noid" once)" "63%"
+jq -n '{oauthAccount: {emailAddress: "second@example.com"}}' > "$W/p/.claude-noid/.claude.json"
+lacks "until it is logged into someone else"        "$(runin "$W/p/.claude-noid" once)" "63%"
 
 # ---------------------------------------------------------- rate limits ----
 group "rate limits"
-retry_file() { printf '%s' "$W/cache/claude-usage/$(key "$W/p/.claude-$1").retry"; }
+retry_file() { printf '%s.retry' "$(cachefile "$1")"; }
 set_wait() { printf '%s %s\n' "$2" "$3" > "$(retry_file "$1")"; }
 asks() { grep -c "^$1\$" "$STUB_TOKENS"; }
 # waited <name> <streak> <min> <max> - the saved wait has that streak and ends
@@ -359,6 +396,68 @@ maxb=$(block_of "$(run once)" MAX)
 if [ "$(asks tok-max)" = "$before" ]; then pass "a reading under a minute old is reused, not asked for"
 else fail "a reading under a minute old was asked for again"; fi
 has   "and shows as current"                       "$maxb" "updated"
+
+# two dirs logged into one account and organisation share its reading and its
+# wait; the same account in another organisation is another pool entirely
+mkprofile twin1 tok-twin1 3600
+mkprofile twin2 tok-twin2 3600
+for t in twin1 twin2; do
+  jq -n '{oauthAccount: {emailAddress: "twin@example.com", accountUuid: "uuid-twin",
+    organizationUuid: "org-twin"}}' > "$W/p/.claude-$t/.claude.json"
+done
+TWINS="$W/p/.claude-twin1:$W/p/.claude-twin2"
+twins() { echo $(( $(asks tok-twin1) + $(asks tok-twin2) )); }
+before=$(twins)
+out=$(runin "$TWINS" once)
+if [ $(( $(twins) - before )) = 1 ]; then pass "two dirs on one account send one request"
+else fail "two dirs on one account sent $(( $(twins) - before )) requests"; fi
+has   "and both show its reading"                  "$(block_of "$out" TWIN2)" " 45%"
+twinfile="$W/cache/claude-usage/acct-uuid-twin-org-twin"
+stampf "$twinfile" $(( $(now) - 120 ))
+printf '%s 1\n' $(( $(now) + 600 )) > "$twinfile.retry"
+before=$(twins)
+out=$(runin "$TWINS" once)
+if [ "$(twins)" = "$before" ]; then pass "a 429 wait holds for every dir on the account"
+else fail "a 429 wait did not hold for every dir on the account"; fi
+has   "and both say so"                            "$(block_of "$out" TWIN2)" "rate limited"
+mkprofile orga tok-alpha 3600
+mkprofile orgb tok-max   3600
+for o in a b; do
+  jq -n --arg o "org-$o" '{oauthAccount: {emailAddress: "one@example.com", accountUuid: "uuid-one",
+    organizationUuid: $o}}' > "$W/p/.claude-org$o/.claude.json"
+done
+out=$(runin "$W/p/.claude-orga:$W/p/.claude-orgb" once)
+has   "one account in two organisations keeps two readings" "$(block_of "$out" ORGA)" " 45%"
+has   "each its own"                               "$(block_of "$out" ORGB)" " 92%"
+
+# a dir that switches accounts during a wait: the wait was the old account's.
+# The old account earns it the real way, a 429 asking for 15 minutes.
+mkprofile switcher tok-slow 3600
+runin "$W/p/.claude-switcher" once > /dev/null
+jq -n '{oauthAccount: {emailAddress: "new@example.com", accountUuid: "uuid-new",
+  organizationUuid: "org-new"}}' > "$W/p/.claude-switcher/.claude.json"
+jq '.claudeAiOauth.accessToken = "tok-switcher"' "$W/p/.claude-switcher/.credentials.json" > "$W/c.json" &&
+  mv "$W/c.json" "$W/p/.claude-switcher/.credentials.json"
+before=$(asks tok-switcher)
+sw=$(block_of "$(runin "$W/p/.claude-switcher" once)" SWITCHER)
+if [ "$(asks tok-switcher)" = $(( before + 1 )) ]; then pass "a wait stays with its account when the dir switches"
+else fail "the new account was not asked after a switch"; fi
+lacks "so the new account is not rate limited"     "$sw" "rate limited"
+
+# two runs miss the cache in the same moment; the stub answers the first and
+# gives the second a 429, which must take the first's reading and start no wait
+mkprofile race tok-race 3600
+( runin "$W/p/.claude-race" once > "$W/race1" ) &
+( runin "$W/p/.claude-race" once > "$W/race2" ) &
+wait
+if [ "$(asks tok-race)" = 2 ]; then pass "two runs at once both asked (the collision happened)"
+else fail "the race was not exercised: tok-race asked $(asks tok-race) times"; fi
+for r in race1 race2; do
+  has   "$r shows the reading"                     "$(block_of "$(cat "$W/$r")" RACE)" " 45%"
+  lacks "$r is not rate limited"                   "$(block_of "$(cat "$W/$r")" RACE)" "rate limited"
+done
+if [ -e "$(retry_file race)" ]; then fail "a collision starts no wait (got: $(cat "$(retry_file race)"))"
+else pass "a collision starts no wait"; fi
 
 # ---------------------------------------------------------------- output ----
 group "output"

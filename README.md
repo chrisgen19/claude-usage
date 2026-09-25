@@ -102,9 +102,10 @@ just short of its marker: on pace, with little room to spare.
 `as of 09:31 (3h ago)`, with the reason underneath. A window whose reset time
 has passed since then shows `0%  reset at ...`, because it restarted from zero.
 If you have used that account elsewhere since, the real figure may be higher.
-A reading belongs to the account it was read for: if a profile is logged into
-another account, the old reading is dropped rather than shown under the new
-name.
+A reading belongs to the account and organisation it was read for (one email
+can hold a Pro plan and a Team seat, each with its own limits). If a profile is
+logged into another, the old reading is dropped rather than shown under the
+new name.
 
 ## Logins
 
@@ -119,7 +120,9 @@ The token never leaves memory except to go to `api.anthropic.com`:
 - It reaches `curl` on stdin (`-H @-`), never on a command line, so `ps` cannot
   show it.
 - The cache in `~/.cache/claude-usage/` holds numbers only: when each reading
-  was taken, a checksum standing in for the account, and the readings.
+  was taken, a checksum standing in for the account, and the readings. Files
+  are named for the account and organisation ids from `.claude.json`, which
+  are identifiers, not secrets.
 - Nothing is printed but the account's user name (the part before the `@`) and
   plan.
 
@@ -133,9 +136,11 @@ The self test asserts all three.
 - **It is rate-limited,** to about one read a minute per account; a second one
   gets a 429. So a reading under a minute old, taken by any `claude-usage` on
   this machine, is reused instead of asked for again, which lets a live view
-  and a `once` run, or two live views, share the minute. After a 429 that
-  account waits 2 minutes, then 4, then 5, and the wait is kept beside the
-  cache so every `claude-usage` here keeps to it. The endpoint does send
+  and a `once` run, or two live views, share the minute; so do two profiles
+  logged into the same account. If two copies still ask in the same moment,
+  the one that gets the 429 takes the other's reading instead of waiting.
+  After a real 429 that account waits 2 minutes, then 4, then 5, and the wait
+  is kept beside the cache so every `claude-usage` here keeps to it. The endpoint does send
   `retry-after`, but has said `0` and then refused the retry, so it only
   counts when it asks for longer. A copy on another machine cannot see any of
   this, so it may still collide; the wait is what keeps that from repeating.
