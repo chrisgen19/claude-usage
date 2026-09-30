@@ -13,7 +13,7 @@
 # Dependencies: bash 4.2+, curl 7.55+ (for -H @-), jq.
 
 set -uo pipefail
-VERSION=0.1.0
+VERSION=0.2.0
 PROG=${0##*/}
 
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] ||
