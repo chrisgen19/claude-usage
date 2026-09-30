@@ -2,8 +2,8 @@
 
 [![ci](https://github.com/chrisgen19/claude-usage/actions/workflows/ci.yml/badge.svg)](https://github.com/chrisgen19/claude-usage/actions/workflows/ci.yml)
 
-The 5-hour and 7-day limits of every Claude Code profile you run, on one screen,
-without opening a session in each.
+The 5-hour and 7-day limits of every Claude Code profile you run, and of
+Codex, on one screen, without opening a session in each.
 
 A single bash script. Needs `curl` and `jq`, nothing else.
 
@@ -24,6 +24,10 @@ A single bash script. Needs `curl` and `jq`, nothing else.
    5h      ░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0%  reset at 12:21
    7d      ██████████████████████░│░░░░  79%  resets Sat 26 Sep 16:51 in 1d4h
 
+ CODEX  alex  plus  updated 12:31
+   5h      ███████▌░░░░░│░░░░░░░░░░░░░░  27%  resets 15:02            in 2h31m
+   7d      ████████████████│██░░░░░░░░░  68%  resets Mon 28 Sep 08:31 in 2d20h
+
  │ time gone in each window: usage past it is ahead of pace
  r refresh  q quit
 ```
@@ -40,6 +44,9 @@ work account has headroom before you switch to it means opening it and running
 
 `claude-usage` asks for all of them at once, and keeps asking.
 
+Codex has the same two windows and the same problem: `/status` shows them, but
+only inside a session. So its profiles sit on the same screen.
+
 ## How it works
 
 1. **Finds your profiles.** Every `~/.claude-*/` directory Claude Code has
@@ -52,6 +59,9 @@ work account has headroom before you switch to it means opening it and running
    claude.ai, counts too.
 4. **Keeps the last good reading** per profile, so an expired login or a
    dropped connection still shows something, marked with its age.
+5. **Adds Codex.** `~/.codex`, `$CODEX_HOME` and any `~/.codex-*/` Codex has
+   used each get a `CODEX` block. The login in `auth.json` goes to the
+   endpoint Codex asks for its own limits. See [Codex](#codex).
 
 ## Install
 
@@ -107,22 +117,45 @@ can hold a Pro plan and a Team seat, each with its own limits). If a profile is
 logged into another, the old reading is dropped rather than shown under the
 new name.
 
+## Codex
+
+A Codex profile is a `CODEX_HOME`: `~/.codex` is labelled `CODEX`, and
+`~/.codex-work` is labelled `CODEX-WORK`. Its 5h and 7d rows are Codex's two
+windows, and a plan that only has a weekly limit shows just the 7d row.
+
+**When the live read fails**, whether the login has expired, the connection is
+down, or `chatgpt.com` turns the request away, a Codex profile has a second
+source. Every Codex session logs the limits it was told on each turn, so
+`claude-usage` takes the newest from the session logs when it is newer than
+the reading it already has. It says so: `as of 09:31 (3h ago) from Codex's
+session log`. A log is only used if it was written after the login was
+saved, since an older one may belong to an account that has since logged out.
+
+**An API key login** (`codex login --with-api-key`) is billed per token and
+has no plan limits, and says so.
+
+**Not read:** a Codex login kept in the OS keyring instead of `auth.json`.
+Its session logs still are.
+
 ## Logins
 
 A login is **read, never refreshed**. Refreshing an OAuth login rotates the
 token, and rewriting it underneath a running Claude Code session can sign that
 session out. So when a login expires (after a few hours unused), the profile
 says so and keeps its last reading until you next open Claude Code with it,
-which renews the login the normal way.
+which renews the login the normal way. A Codex login is treated the same way,
+and is renewed by opening Codex.
 
-The token never leaves memory except to go to `api.anthropic.com`:
+The token never leaves memory except to go to `api.anthropic.com`, or to
+`chatgpt.com` for a Codex login:
 
 - It reaches `curl` on stdin (`-H @-`), never on a command line, so `ps` cannot
   show it.
 - The cache in `~/.cache/claude-usage/` holds numbers only: when each reading
   was taken, a checksum standing in for the account, and the readings. Files
-  are named for the account and organisation ids from `.claude.json`, which
-  are identifiers, not secrets.
+  are named for the account and organisation ids from `.claude.json`, or a
+  Codex login's user and workspace ids, which are identifiers, not secrets.
+  The workspace id goes to `chatgpt.com` in a header, beside the token.
 - Nothing is printed but the account's user name (the part before the `@`) and
   plan.
 
@@ -133,6 +166,14 @@ The self test asserts all three.
 - **The usage endpoint is not a public API.** It is what Claude Code's own
   `/usage` calls, and it could change without notice. If it does, profiles show
   `unexpected answer from the usage endpoint` rather than wrong numbers.
+- **The Codex endpoint is not a public API either.**
+  `chatgpt.com/backend-api/wham/usage` is what Codex's own client asks for
+  its limits. The self test covers it through a stub, but it has not been
+  tried against a live ChatGPT login yet. How often it may be read is not
+  known, so it keeps to the same one read a minute and the same waits after
+  a 429. `chatgpt.com` can also turn a request away with a page of its own
+  before it reaches the endpoint. That shows as `chatgpt.com turned the
+  request away (403)`, not as a rejected login, and the session logs stand in.
 - **It is rate-limited,** to about one read a minute per account; a second one
   gets a 429. So a reading under a minute old, taken by any `claude-usage` on
   this machine, is reused instead of asked for again, which lets a live view
@@ -159,6 +200,8 @@ The self test asserts all three.
 | Variable | Effect |
 | --- | --- |
 | `CLAUDE_USAGE_DIRS` | Colon-separated config dirs to watch, e.g. `~/.claude-work:~/.claude-personal` |
+| `CLAUDE_USAGE_CODEX_DIRS` | Colon-separated Codex homes to watch. Set but empty, no Codex profiles at all |
+| `CODEX_HOME` | A Codex home to watch besides `~/.codex` and `~/.codex-*/` |
 | `CLAUDE_USAGE_ASCII` | `1` draws with `#` and `.` instead of block glyphs |
 | `NO_COLOR` | `1` turns colour off |
 | `XDG_CACHE_HOME` | Last readings live in `$XDG_CACHE_HOME/claude-usage` (default `~/.cache`) |
@@ -173,8 +216,8 @@ scripts/selftest
 `scripts/selftest` is the whole test suite and runs anywhere, offline. `curl`
 is replaced by a stub on `PATH` that answers by token, and every profile is a
 throwaway directory. Besides the readings themselves (offsets and fractional
-seconds in reset times, plans with extra weekly limits, every failure path), it
-asserts that a token never reaches a command line, the cache or the screen, and
+seconds in reset times, plans with extra weekly limits, Codex's answers and
+session logs, every failure path), it asserts that a token never reaches a command line, the cache or the screen, and
 that an expired login is never sent at all.
 
 Both the ci and release workflows run that same script, so a tagged release
