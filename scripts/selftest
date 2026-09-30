@@ -11,6 +11,8 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 export NO_COLOR=1
+# a Codex home of your own must not join the suite's profiles
+unset CODEX_HOME CLAUDE_USAGE_CODEX_DIRS
 CU=$PWD/claude-usage
 fails=0
 
@@ -81,6 +83,7 @@ printf '%s\n' "$*" >> "$STUB_ARGV"
 tok=${hdr#Authorization: Bearer }
 tok=${tok%%[[:space:]]*}
 printf '%s\n' "$tok" >> "$STUB_TOKENS"
+printf '%s\n' "$hdr" | sed -n 's/^ChatGPT-Account-Id: //p' >> "$STUB_ACCOUNTS"
 out=""; hdrs=""
 while [ $# -gt 0 ]; do
   case $1 in
@@ -113,12 +116,21 @@ case $tok in
   tok-slow)     printf '{"error":{"type":"rate_limit_error"}}' > "$out"; answer 429 900 ;;
   tok-garbage)  printf '<html>oops</html>' > "$out"; answer 200 ;;
   tok-offline)  echo 'curl: (7) Failed to connect' >&2; exit 7 ;;
+  # Codex tokens are JWTs; the stub knows them by their first part
+  ctok-alpha.*)    cp "$STUB_FIX/codex-alpha.json" "$out"; answer 200 ;;
+  ctok-weekly.*)   cp "$STUB_FIX/codex-weekly.json" "$out"; answer 200 ;;
+  ctok-nolimits.*) printf '{"plan_type":"enterprise","rate_limit":null}' > "$out"; answer 200 ;;
+  ctok-odd.*)      printf '{"detail":"Not Found"}' > "$out"; answer 200 ;;
+  ctok-rejected.*) printf '{"detail":"Could not validate credentials"}' > "$out"; answer 401 ;;
+  ctok-blocked.*)  printf '<html>Just a moment...</html>' > "$out"; answer 403 ;;
+  ctok-offline.*)  echo 'curl: (7) Failed to connect' >&2; exit 7 ;;
   *)            echo "stub: unknown token" >&2; exit 99 ;;
 esac
 STUB
 chmod +x "$W/bin/curl"
 export STUB_ARGV="$W/argv.log" STUB_TOKENS="$W/tokens.log" STUB_FIX="$W/fix" STUB_RACE="$W/race.lock"
-: > "$STUB_ARGV"; : > "$STUB_TOKENS"
+export STUB_ACCOUNTS="$W/accounts.log"
+: > "$STUB_ARGV"; : > "$STUB_TOKENS"; : > "$STUB_ACCOUNTS"
 
 # ------------------------------------------------------------ fixtures ----
 # 5h resets on a minute boundary about 1h30m out, but the API reports it
@@ -486,6 +498,173 @@ if [ "$rc" = 0 ]; then pass "piped with no command: one snapshot"; else fail "pi
 has   "and it is the report"                       "$out" "CLAUDE USAGE"
 out=$(run watch 60 | cat)
 has   "watch without a terminal falls back to once" "$out" "CLAUDE USAGE"
+
+# ---------------------------------------------------------------- codex ----
+# A Codex home holds auth.json: an access token that is a JWT with an exp
+# claim, and an id_token whose claims carry the email, user, workspace and
+# plan. Its session logs hold the limits Codex was last told.
+group "codex"
+# the suite has been running a while: countdowns here start from now
+CN=$(now)
+tsz() { jq -nr --argjson t "$1" '$t | todate'; }
+b64u() { printf '%s' "$1" | base64 | tr '+/' '-_' | tr -d '=\n'; }
+# mkcodex <name> <token or -> <expires in seconds> [plan] - a login saved long
+# ago, so any session log written in this run is newer than it
+mkcodex() {
+  local d="$W/p/.codex-$1" id
+  mkdir -p "$d"
+  [ "$2" = - ] && return 0
+  id=$(jq -cn --arg e "$1@example.com" --arg p "${4:-plus}" --arg u "user-$1" --arg a "ws-$1" \
+    '{email: $e, "https://api.openai.com/auth": {chatgpt_plan_type: $p, chatgpt_user_id: $u, chatgpt_account_id: $a}}')
+  jq -n --arg id "hdr.$(b64u "$id").sig" --arg t "$2.$(b64u "{\"exp\":$(( CN + $3 ))}").sig" --arg a "ws-$1" \
+    '{auth_mode: "chatgpt", OPENAI_API_KEY: null, last_refresh: "2020-01-01T00:00:00Z",
+      tokens: {id_token: $id, access_token: $t, refresh_token: "codex-refresh-secret", account_id: $a}}' \
+    > "$d/auth.json"
+  touch -t 202001010000 "$d/auth.json"
+}
+# mklog <name> - a session log whose newest Codex limits, 10 minutes old, are
+# 12% and 64%. After them come another limit's 99%, a Codex snapshot with
+# neither window, and a line cut off mid-write.
+mklog() {
+  local f="$W/p/.codex-$1/sessions/2026/09/28/rollout-2026-09-28T10-00-00-$1.jsonl"
+  mkdir -p "${f%/*}"
+  {
+    jq -cn '{type: "session_meta", payload: {id: "s"}}'
+    jq -cn --arg ts "$(tsz $(( CN - 900 )))" '{timestamp: $ts, type: "event_msg",
+      payload: {type: "token_count", rate_limits: {limit_id: "codex",
+        primary: {used_percent: 50.0, window_minutes: 300, resets_at: 1}}}}'
+    jq -cn --arg ts "$(tsz $(( CN - 600 )))" --argjson a $(( CN + 3000 )) --argjson b $(( CN + 200000 )) \
+      '{timestamp: $ts, type: "event_msg", payload: {type: "token_count", rate_limits: {limit_id: "codex",
+        primary: {used_percent: 12.0, window_minutes: 300, resets_at: $a},
+        secondary: {used_percent: 64.0, window_minutes: 10080, resets_at: $b}}}}'
+    jq -cn --arg ts "$(tsz $(( CN - 300 )))" --argjson a $(( CN + 3000 )) '{timestamp: $ts, type: "event_msg",
+      payload: {type: "token_count", rate_limits: {limit_id: "codex_other",
+        primary: {used_percent: 99.0, window_minutes: 300, resets_at: $a}}}}'
+    jq -cn --arg ts "$(tsz $(( CN - 200 )))" '{timestamp: $ts, type: "event_msg",
+      payload: {type: "token_count", rate_limits: {limit_id: "codex", primary: null, secondary: null}}}'
+    printf '{"timestamp":"2026'
+  } > "$f"
+}
+jq -n --argjson a $(( CN + 5430 )) --argjson b $(( CN + 300000 )) '{plan_type: "plus",
+  rate_limit: {allowed: true, limit_reached: false,
+    primary_window: {used_percent: 33, limit_window_seconds: 18000, reset_after_seconds: 5400, reset_at: $a},
+    secondary_window: {used_percent: 71, limit_window_seconds: 604800, reset_after_seconds: 300000, reset_at: $b}},
+  credits: {has_credits: false, unlimited: false, balance: null}}' > "$W/fix/codex-alpha.json"
+# a plan with only a weekly limit reports it as primary, with no reset_at
+jq -n '{plan_type: "free", rate_limit: {allowed: true, limit_reached: false,
+  primary_window: {used_percent: 40, limit_window_seconds: 604800, reset_after_seconds: 172800},
+  secondary_window: null}}' > "$W/fix/codex-weekly.json"
+
+mkcodex alpha    ctok-alpha    3600
+mkcodex weekly   ctok-weekly   3600 free
+mkcodex nolimits ctok-nolimits 3600 enterprise
+mkcodex odd      ctok-odd      3600
+mkcodex rejected ctok-rejected 3600
+mkcodex blocked  ctok-blocked  3600
+mkcodex offline  ctok-offline  3600;  mklog offline
+mkcodex expired  ctok-expired  -7200; mklog expired
+mkcodex oldlog   ctok-offline  3600;  mklog oldlog
+touch -t 201901010000 "$W/p/.codex-oldlog/sessions/2026/09/28/"*.jsonl
+mkcodex nologin  -             0;     mklog nologin
+# logged in after the log's last reading, then the log touched (a session
+# resumed without a turn): the file is newer, its reading is not
+mkcodex prelogin ctok-offline  3600;  mklog prelogin
+touch -t "$(printf '%(%Y%m%d%H%M)T' $(( CN - 120 )))" "$W/p/.codex-prelogin/auth.json"
+touch "$W/p/.codex-prelogin/sessions/2026/09/28/"*.jsonl
+mkdir -p "$W/p/.codex-apikey"
+printf '{"auth_mode":"apikey","OPENAI_API_KEY":"sk-codex-secret","tokens":null}' > "$W/p/.codex-apikey/auth.json"
+CDIRS=""
+for n in alpha weekly nolimits odd rejected blocked offline expired oldlog nologin prelogin apikey; do CDIRS+="$W/p/.codex-$n:"; done
+# runcodex <dirs> <args...> - claude-usage watching only these Codex homes
+runcodex() { PATH="$W/bin:$PATH" HOME="$W/home" XDG_CACHE_HOME="$W/cache" CLAUDE_USAGE_DIRS="" CLAUDE_USAGE_CODEX_DIRS="$1" "$CU" "${@:2}"; }
+
+: > "$STUB_ARGV"; : > "$STUB_TOKENS"; : > "$STUB_ACCOUNTS"
+out=$(runcodex "$CDIRS" once); rc=$?
+if [ "$rc" = 0 ]; then pass "once exits 0 with Codex profiles"; else fail "once with Codex exited $rc"; fi
+cal=$(block_of "$out" CODEX-ALPHA)
+has   "a Codex home is labelled CODEX-*"           "$cal" "CODEX-ALPHA  alpha  plus  updated"
+has   "5h percent from the primary window"         "$cal" " 33%"
+has   "7d percent from the secondary window"       "$cal" " 71%"
+has   "5h reset from reset_at"                     "$cal" "in 1h30m"
+has   "7d reset from reset_at"                     "$cal" "in 3d11h"
+cw=$(block_of "$out" CODEX-WEEKLY)
+has   "a weekly-only plan fills the 7d row"        "$cw" " 40%"
+has   "from reset_after_seconds"                   "$cw" "in 2d"
+lacks "and has no 5h row"                          "$cw" " 5h "
+has   "rate_limit null is no limits"               "$(block_of "$out" CODEX-NOLIMITS)" "no usage limits reported"
+has   "an answer without rate_limit is unexpected" "$(block_of "$out" CODEX-ODD)" "unexpected answer"
+has   "401 is a rejected login, renewed in Codex"  "$(block_of "$out" CODEX-REJECTED)" "login rejected (401): open Codex with CODEX_HOME="
+cb=$(block_of "$out" CODEX-BLOCKED)
+has   "a 403 page that is not JSON is turned away" "$cb" "chatgpt.com turned the request away (403)"
+lacks "and not a rejected login"                   "$cb" "login rejected"
+co=$(block_of "$out" CODEX-OFFLINE)
+has   "offline names chatgpt.com"                  "$co" "offline: cannot reach chatgpt.com"
+has   "and falls back to the session log's 5h"     "$co" " 12%"
+has   "and its 7d"                                 "$co" " 64%"
+has   "saying where it came from"                  "$co" "from Codex's session log"
+has   "with the log reading's age"                 "$co" "(10m ago)"
+lacks "never another limit's numbers"              "$co" " 99%"
+lacks "nor an older reading in the same log"       "$co" " 50%"
+lacks "a snapshot with neither window is skipped"  "$co" "no usage limits reported"
+ce=$(block_of "$out" CODEX-EXPIRED)
+has   "an expired Codex login is named"            "$ce" "login expired 2h ago"
+has   "and still shows the session log"            "$ce" " 64%"
+col=$(block_of "$out" CODEX-OLDLOG)
+lacks "a log older than the login is not used"     "$col" " 12%"
+has   "so there is nothing to show"                "$col" "offline"
+cpl=$(block_of "$out" CODEX-PRELOGIN)
+lacks "nor a reading taken before the login"       "$cpl" " 12%"
+has   "even in a log written since"                "$cpl" "offline"
+cn=$(block_of "$out" CODEX-NOLOGIN)
+has   "no auth.json is not logged in"              "$cn" "not logged in"
+has   "yet the session log still shows"            "$cn" " 64%"
+has   "an API key login has no plan limits"        "$(block_of "$out" CODEX-APIKEY)" "API key"
+
+tokens=$(cat "$STUB_TOKENS"); argv=$(cat "$STUB_ARGV")
+has   "a Codex token reaches curl in the header"   "$tokens" "ctok-alpha."
+lacks "an expired Codex login is never sent"       "$tokens" "ctok-expired"
+has   "Codex is asked at its usage endpoint"       "$argv" "chatgpt.com/backend-api/wham/usage"
+lacks "no Codex token on curl's command line"      "$argv" "ctok-"
+has   "the workspace goes in a header"             "$(cat "$STUB_ACCOUNTS")" "ws-alpha"
+lacks "and not on the command line"                "$argv" "ws-alpha"
+lacks "no Codex token on screen"                   "$out" "ctok-"
+lacks "never the whole Codex address"              "$out" "@example.com"
+lacks "no API key on screen"                       "$out" "sk-codex"
+ccache=$(cat "$W/cache/claude-usage/codex-"*)
+lacks "no Codex token in the cache"                "$ccache" "ctok-"
+lacks "no Codex refresh token in the cache"        "$ccache" "codex-refresh-secret"
+if printf '%s\n' "$ccache" | grep -qvE '^[0-9]+ [0-9]+( -?[0-9]+){8}$'; then
+  fail "a Codex reading holds numbers only"
+else
+  pass "a Codex reading holds numbers only"
+fi
+if [ -f "$W/cache/claude-usage/codex-user-alpha-ws-alpha" ]; then pass "filed under the user and workspace"
+else fail "filed under the user and workspace (got: $(printf '%s ' "$W/cache/claude-usage"/*))"; fi
+before=$(grep -c '^ctok-alpha\.' "$STUB_TOKENS")
+has   "a Codex reading under a minute old is reused" "$(block_of "$(runcodex "$W/p/.codex-alpha" once)" CODEX-ALPHA)" " 33%"
+if [ "$(grep -c '^ctok-alpha\.' "$STUB_TOKENS")" = "$before" ]; then pass "without asking again"
+else fail "a Codex reading under a minute old was asked for again"; fi
+out=$(PATH="$W/bin:$PATH" HOME="$W/home" XDG_CACHE_HOME="$W/cache" CLAUDE_USAGE_DIRS="$W/p/.claude-max" \
+  CLAUDE_USAGE_CODEX_DIRS="$W/p/.codex-alpha" "$CU" once)
+has   "Claude and Codex profiles share one screen" "$out" "MAX"
+has   "side by side"                               "$out" "CODEX-ALPHA"
+
+# discovery: ~/.codex, ~/.codex-*/ with a login or sessions, and $CODEX_HOME,
+# each once; CLAUDE_USAGE_CODEX_DIRS set empty turns Codex off
+H="$W/cdisc"
+mkdir -p "$H/.codex" "$H/.codex-work/sessions" "$H/.codex-unused" "$H/.claude-a"
+cp "$W/p/.codex-alpha/auth.json" "$H/.codex/auth.json"
+printf '{}' > "$H/.claude-a/.claude.json"
+out=$(HOME="$H" PATH="$W/bin:$PATH" "$CU" profiles)
+has   "finds ~/.codex"                             "$out" " CODEX "
+has   "finds ~/.codex-work by its sessions"        "$out" "CODEX-WORK"
+lacks "skips a Codex home never used"              "$out" "UNUSED"
+has   "alongside the Claude profiles"              "$out" " A "
+has   "profiles shows a Codex login's expiry"      "$(printf '%s\n' "$out" | grep '^ CODEX ')" "valid until"
+n=$(HOME="$H" PATH="$W/bin:$PATH" CODEX_HOME="$H/.codex/" "$CU" profiles | grep -c '^ CODEX ')
+if [ "$n" = 1 ]; then pass "CODEX_HOME naming ~/.codex lists it once"; else fail "CODEX_HOME naming ~/.codex listed it $n times"; fi
+lacks "CLAUDE_USAGE_CODEX_DIRS empty leaves Codex out" \
+  "$(HOME="$H" PATH="$W/bin:$PATH" CLAUDE_USAGE_CODEX_DIRS="" "$CU" profiles)" "CODEX"
 
 # ------------------------------------------------------------- keychain ----
 # A stand-in Mac: uname says Darwin, and security answers from a directory of

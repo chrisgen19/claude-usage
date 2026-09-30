@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# claude-usage - the 5-hour and 7-day limits of every Claude Code profile on
-# one screen, without opening a session in each.
+# claude-usage - the 5-hour and 7-day limits of every Claude Code profile, and
+# every Codex one, on one screen, without opening a session in each.
 #
 # A profile is a CLAUDE_CONFIG_DIR. Its login is read from .credentials.json
 # there (the Keychain on macOS) and handed to the usage endpoint behind /usage.
-# A login is only ever read: refreshing one rotates the token and can sign out
-# a Claude session running in that profile, so an expired login is reported,
-# never renewed.
+# A Codex profile is a CODEX_HOME: its login is auth.json, handed to the
+# endpoint Codex asks for its own limits, and its session logs stand in when
+# that cannot be read. A login is only ever read: refreshing one rotates the
+# token and can sign out a session running in that profile, so an expired
+# login is reported, never renewed.
 #
 # Dependencies: bash 4.2+, curl 7.55+ (for -H @-), jq.
 
@@ -23,6 +25,9 @@ fi
 
 API_URL=https://api.anthropic.com/api/oauth/usage
 API_BETA=oauth-2025-04-20
+# What Codex's own client asks for a ChatGPT login's limits. Not a public API
+# either, and it wants the workspace the login belongs to beside the token.
+CODEX_URL=https://chatgpt.com/backend-api/wham/usage
 # The endpoint allows about one read a minute per account, and answers a
 # second one with a 429. Any claude-usage on this machine reuses a reading
 # younger than READ_GAP instead of asking again, and after a 429 that account
@@ -118,6 +123,8 @@ _clock() {
 
 # -------------------------------------------------------------- profiles ----
 P_DIR=(); P_SHORT=(); P_KEY=(); P_DKEY=(); P_LABEL=(); P_COL=(); P_WHO=(); P_PLAN=()
+P_KIND=()    # claude | codex
+P_SRC=()     # "log" when the shown numbers came from a Codex session log
 P_STATE=()   # pending | ok | stale | none
 P_NOTE=()    # why a profile is not fresh, shown under its name
 P_AT=()      # epoch the shown numbers were read, 0 for never
@@ -137,12 +144,19 @@ cache_key() {
   REPLY="${safe}-${sum%% *}"
 }
 
+# add_profile <dir> [claude|codex] - a Codex dir is labelled CODEX, CODEX-WORK
+# and so on, so it never reads as a Claude profile of the same name
 add_profile() {
-  local dir=${1%/} i=${#P_DIR[@]} b
-  b=${dir##*/}; b=${b#.}; b=${b#claude-}
-  [ "$b" = claude ] && b=default
+  local dir=${1%/} kind=${2:-claude} i=${#P_DIR[@]} b
+  b=${dir##*/}; b=${b#.}
+  if [ "$kind" = codex ]; then
+    [[ $b == codex* ]] || b="codex-$b"
+  else
+    b=${b#claude-}
+    [ "$b" = claude ] && b=default
+  fi
   cache_key "$dir"
-  P_DIR+=("$dir")
+  P_DIR+=("$dir"); P_KIND+=("$kind")
   P_SHORT+=("${dir/#"$HOME"/\~}")
   P_KEY+=("$REPLY"); P_DKEY+=("$REPLY")
   P_LABEL+=("${b^^}")
@@ -151,10 +165,11 @@ add_profile() {
     DEV)      P_COL+=("$C_G") ;;
     WORK)     P_COL+=("$C_Y") ;;
     PERSONAL) P_COL+=("$C_C") ;;
+    CODEX)    P_COL+=("$C_BL") ;;
     *) local cyc=("$C_M" "$C_BL" "$C_G" "$C_Y" "$C_C"); P_COL+=("${cyc[i % 5]}") ;;
   esac
   P_WHO+=(""); P_PLAN+=(""); P_STATE+=(pending); P_NOTE+=(""); P_AT+=(0); P_DATA+=("")
-  P_ACCT+=(""); P_ID+=(""); P_RETRY+=(0)
+  P_ACCT+=(""); P_ID+=(""); P_RETRY+=(0); P_SRC+=("")
 }
 
 # CLAUDE_USAGE_DIRS when set, else every ~/.claude-*/ that Claude Code has
@@ -174,8 +189,31 @@ discover() {
     done
     [ "${#P_DIR[@]}" -gt 0 ] || { [ -d "$HOME/.claude" ] && add_profile "$HOME/.claude"; }
   fi
+  discover_codex
   [ "${#P_DIR[@]}" -gt 0 ] ||
-    die "no Claude Code profiles found (looked for ~/.claude-*/ and ~/.claude) - set CLAUDE_USAGE_DIRS"
+    die "no Claude Code or Codex profiles found (looked for ~/.claude-*/, ~/.claude and ~/.codex) - set CLAUDE_USAGE_DIRS"
+}
+
+# CLAUDE_USAGE_CODEX_DIRS when set, and set but empty means no Codex at all.
+# Else ~/.codex, $CODEX_HOME and every ~/.codex-*/ that Codex has written a
+# login or a session into, each once.
+discover_codex() {
+  local d list=() seen=":"
+  if [ -n "${CLAUDE_USAGE_CODEX_DIRS+set}" ]; then
+    IFS=: read -ra list <<< "$CLAUDE_USAGE_CODEX_DIRS"
+    for d in ${list[@]+"${list[@]}"}; do
+      [ -n "$d" ] && add_profile "${d/#\~/$HOME}" codex
+    done
+    return 0
+  fi
+  for d in "$HOME/.codex" "${CODEX_HOME:-}" "$HOME"/.codex-*/; do
+    d=${d%/}
+    [ -d "$d" ] || continue
+    [ -f "$d/auth.json" ] || [ -d "$d/sessions" ] || continue
+    case $seen in *":$d:"*) continue ;; esac
+    seen+="$d:"
+    add_profile "$d" codex
+  done
 }
 
 # ----------------------------------------------------------------- login ----
@@ -202,12 +240,28 @@ keychain_login() {
   return 1
 }
 
-# load_login <i> - sets TOKEN and TOKEN_EXP (epoch ms), fills in who and plan.
-# TOKEN stays in this shell: it reaches jq and curl through pipes, never argv
-# and never a file.
-load_login() {
-  local i=$1 dir=${P_DIR[$1]} sub="" tier="" who="" uuid="" org="" id
-  TOKEN=""; TOKEN_EXP=0
+# A Codex login is auth.json: the access token and the workspace it is for,
+# beside an id_token whose claims carry the email, user and plan. The access
+# token's own exp claim is when it stops working. Decoding a claim only reads
+# it; nothing here can renew or rewrite the login.
+# shellcheck disable=SC2016  # a jq program: $t, $id and $a are jq's own
+JQ_CODEX_LOGIN='
+def claims: try (split(".")[1] | gsub("-"; "+") | gsub("_"; "/")
+  | . + ("=" * ((4 - length % 4) % 4)) | @base64d | fromjson) catch {};
+(.tokens // {}) as $t
+| (($t.id_token // "") | claims) as $id
+| ($id["https://api.openai.com/auth"] // {}) as $a
+| [$t.access_token // "",
+   (($t.access_token // "") | claims | .exp // -1 | if type == "number" then floor else -1 end),
+   $t.account_id // $a.chatgpt_account_id // "",
+   $id.email // "", $a.chatgpt_user_id // $a.user_id // "", $a.chatgpt_plan_type // "",
+   (if .OPENAI_API_KEY then 1 else "" end)]
+| map(tostring) | join("\u001f")'
+
+# login_claude <i> / login_codex <i> - set TOKEN, TOKEN_EXP (epoch ms, -1 for
+# not known) and L_WHO, L_UUID, L_ORG, L_PLAN for load_login
+login_claude() {
+  local dir=${P_DIR[$1]} sub="" tier=""
   if [ -f "$dir/.credentials.json" ]; then
     IFS=$'\x1f' read -r TOKEN TOKEN_EXP sub tier < <(jq -r "$JQ_LOGIN" "$dir/.credentials.json" 2> /dev/null)
   elif [ "$PLATFORM" = darwin ]; then
@@ -215,27 +269,70 @@ load_login() {
   fi
   [[ $TOKEN_EXP =~ ^[0-9]+$ ]] || TOKEN_EXP=0
   if [ -f "$dir/.claude.json" ]; then
-    IFS=$'\x1f' read -r who uuid org < <(jq -r "$JQ_ACCOUNT" "$dir/.claude.json" 2> /dev/null)
+    IFS=$'\x1f' read -r L_WHO L_UUID L_ORG < <(jq -r "$JQ_ACCOUNT" "$dir/.claude.json" 2> /dev/null)
   fi
-  P_WHO[i]=${who%%@*}
+  L_PLAN=$sub
+  [[ $tier =~ max_([0-9]+x) ]] && L_PLAN="$sub ${BASH_REMATCH[1]}"
+  return 0
+}
+
+# A Codex login's limits belong to the user within the workspace, so the pair
+# is its account, the way a Claude account sits in an organisation.
+login_codex() {
+  local dir=${P_DIR[$1]} exp="" apikey=""
+  [ -f "$dir/auth.json" ] || return 0
+  IFS=$'\x1f' read -r TOKEN exp ACCOUNT L_WHO L_UUID L_PLAN apikey < <(jq -r "$JQ_CODEX_LOGIN" "$dir/auth.json" 2> /dev/null)
+  L_ORG=$ACCOUNT
+  # no exp on record is not an expired login: the endpoint says if it is
+  if [[ $exp =~ ^[0-9]+$ ]]; then TOKEN_EXP=$(( exp * 1000 )); else TOKEN_EXP=-1; fi
+  if [ -z "$TOKEN" ] && [ -n "$apikey" ]; then
+    NO_LOGIN="signed in with an API key: billed per token, so there are no plan limits"
+  fi
+  return 0
+}
+
+# load_login <i> - sets TOKEN, TOKEN_EXP (epoch ms, -1 when the login does not
+# say) and ACCOUNT (a Codex login's workspace), fills in who and plan, and sets
+# NO_LOGIN to why there is no token. TOKEN stays in this shell: it reaches jq
+# and curl through pipes, never argv and never a file.
+load_login() {
+  local i=$1 id pre=acct
+  TOKEN=""; TOKEN_EXP=0; ACCOUNT=""; L_WHO=""; L_UUID=""; L_ORG=""; L_PLAN=""
+  NO_LOGIN="not logged in: no login found for ${P_SHORT[i]}"
+  if [ "${P_KIND[i]}" = codex ]; then login_codex "$i"; pre=codex; else login_claude "$i"; fi
+  P_WHO[i]=${L_WHO%%@*}
   # Usage belongs to an account in an organisation: one email can hold a Pro
   # plan and a Team seat, each with its own limits and its own login. Readings
   # and rate-limit waits are filed under that pair, so dirs logged into the
   # same one share them, and a dir that switches finds the new one's. Ids that
   # are not plain uuids go through cksum rather than being flattened together.
-  id=$(printf '%s' "${uuid:-$who}/$org" | cksum); P_ID[i]=${id%% *}
-  if [ -z "$uuid" ]; then P_KEY[i]=${P_DKEY[i]}
-  elif [[ "$uuid-$org" =~ ^[A-Za-z0-9-]+$ ]]; then P_KEY[i]="acct-$uuid-$org"
-  else P_KEY[i]="acct-${P_ID[i]}"
+  id=$(printf '%s' "${L_UUID:-$L_WHO}/$L_ORG" | cksum); P_ID[i]=${id%% *}
+  if [ -z "$L_UUID" ]; then P_KEY[i]=${P_DKEY[i]}
+  elif [[ "$L_UUID-$L_ORG" =~ ^[A-Za-z0-9-]+$ ]]; then P_KEY[i]="$pre-$L_UUID-$L_ORG"
+  else P_KEY[i]="$pre-${P_ID[i]}"
   fi
   # A dir can be logged out and into another account. A reading kept from the
   # old one would then show under the new name, so it goes.
   if [ -n "${P_DATA[i]}" ] && [ "${P_ACCT[i]}" != "${P_ID[i]}" ]; then
-    P_DATA[i]=""; P_AT[i]=0; P_ACCT[i]=""; P_STATE[i]=pending; P_RETRY[i]=0
+    P_DATA[i]=""; P_AT[i]=0; P_ACCT[i]=""; P_STATE[i]=pending; P_RETRY[i]=0; P_SRC[i]=""
   fi
-  P_PLAN[i]=$sub
-  [[ $tier =~ max_([0-9]+x) ]] && P_PLAN[i]="$sub ${BASH_REMATCH[1]}"
+  P_PLAN[i]=$L_PLAN
   [ -n "$TOKEN" ]
+}
+
+# renew_hint <i> - how to renew a profile's login
+renew_hint() {
+  if [ "${P_KIND[$1]}" != codex ]; then REPLY="open Claude Code with ${P_SHORT[$1]} to renew it"
+  elif [ "${P_DIR[$1]}" = "$HOME/.codex" ]; then REPLY="open Codex to renew it"
+  else REPLY="open Codex with CODEX_HOME=${P_SHORT[$1]} to renew it"
+  fi
+}
+
+# login_expired - the login load_login read has run out, or will within a
+# minute. Sets REPLY to how long ago.
+login_expired() {
+  [ "$TOKEN_EXP" -ge 0 ] && [ $(( TOKEN_EXP / 1000 )) -le $(( NOW + 60 )) ] || return 1
+  _ago $(( NOW - TOKEN_EXP / 1000 < 0 ? 0 : NOW - TOKEN_EXP / 1000 ))
 }
 
 # ----------------------------------------------------------------- cache ----
@@ -254,7 +351,7 @@ cache_read() {
 
 cache_load() {
   cache_read "$1" && [ "$CA_ACCT" = "${P_ID[$1]}" ] || return 0
-  P_AT[$1]=$CA_AT; P_ACCT[$1]=$CA_ACCT; P_DATA[$1]=$CA_DATA; P_STATE[$1]=stale
+  P_AT[$1]=$CA_AT; P_ACCT[$1]=$CA_ACCT; P_DATA[$1]=$CA_DATA; P_STATE[$1]=stale; P_SRC[$1]=""
 }
 
 # cache_fresh <i> - take this account's reading from the cache when it is
@@ -264,7 +361,7 @@ cache_load() {
 cache_fresh() {
   local i=$1
   cache_read "$i" && [ "$CA_ACCT" = "${P_ID[i]}" ] && [ $(( NOW - CA_AT )) -lt "$READ_GAP" ] || return 1
-  P_AT[i]=$CA_AT; P_ACCT[i]=$CA_ACCT; P_DATA[i]=$CA_DATA; P_STATE[i]=ok; P_NOTE[i]=""
+  P_AT[i]=$CA_AT; P_ACCT[i]=$CA_ACCT; P_DATA[i]=$CA_DATA; P_STATE[i]=ok; P_NOTE[i]=""; P_SRC[i]=""
 }
 
 cache_save() {
@@ -307,8 +404,8 @@ backoff_clear() { P_RETRY[$1]=0; rm -f "$CACHE_DIR/${P_KEY[$1]}.retry"; }
 # neither, so both are split off and put back by hand. The fraction matters:
 # the API says 06:09:59.72 for a reset at 06:10, and truncating that shows a
 # reset a minute early.
-# shellcheck disable=SC2016  # a jq program: $m, $t and $w are jq's own
-JQ_USAGE='
+# shellcheck disable=SC2016  # a jq program: $m, $t and $s are jq's own
+JQ_EPOCH='
 def epoch:
   if type != "string" then -1
   else ([capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<f>\\.[0-9]+)?(?<z>Z|[+-][0-9]{2}:?[0-9]{2})?$")] | first) as $m
@@ -320,19 +417,68 @@ def epoch:
             | $t - $s * (($m.z[1:3] | tonumber) * 3600 + ($m.z[-2:] | tonumber) * 60)
           end
       end
-  end | . + 0.5 | floor;
+  end | . + 0.5 | floor;'
+# shellcheck disable=SC2016  # a jq program: $k and $w are jq's own
+JQ_USAGE="$JQ_EPOCH"'
 def win($k): .[$k] as $w
   | if ($w | type) != "object" or ($w.utilization | type) != "number" then "-1 -1"
     else "\($w.utilization | floor) \($w.resets_at | epoch)" end;
 [win("five_hour"), win("seven_day"), win("seven_day_opus"), win("seven_day_sonnet")] | join(" ")'
 
-# request <file prefix> <token> - one GET. The header goes in on stdin, so the
-# token is never on a command line where ps could read it.
+# Codex reports a primary and a secondary window, each with its length, from
+# the endpoint in seconds and in a session log in minutes. The length decides
+# the row, since a plan with only a weekly limit reports that one as primary:
+# up to a day is the 5h row, longer the 7d row. A reset is an epoch, or failing
+# that a count of seconds from $base, when the reading was taken.
+# shellcheck disable=SC2016  # a jq program: $base, $w, $ws, $k, $s, $x are jq's own
+JQ_CODEX="$JQ_EPOCH"'
+def cwin($base):
+  if type != "object" or (.used_percent | type) != "number" then null
+  else {
+    len: (.limit_window_seconds // (if (.window_minutes | type) == "number" then .window_minutes * 60 else null end) // -1),
+    pct: (.used_percent | floor),
+    at: (if (.reset_at | type) == "number" then .reset_at
+         elif (.resets_at | type) == "number" then .resets_at
+         elif (.reset_after_seconds | type) == "number" then $base + .reset_after_seconds
+         elif (.resets_in_seconds | type) == "number" then $base + .resets_in_seconds
+         else -1 end | floor)
+  } end;
+def limits($base):
+  [(.primary | cwin($base)), (.secondary | cwin($base))] as $w
+  | [range(0; 2) as $k | $w[$k] | select(. != null)
+     | . + {slot: (if .len > 0 then (if .len <= 86400 then 0 else 1 end) else $k end)}] as $ws
+  | [0, 1] | map(. as $s | ([$ws[] | select(.slot == $s)] | first) as $x
+      | if $x == null then "-1 -1" else "\($x.pct) \($x.at)" end)
+  | . + ["-1 -1", "-1 -1"] | join(" ");'
+# The endpoint's answer. rate_limit is null for a plan with no limits.
+# shellcheck disable=SC2016  # a jq program: $now is jq's own
+JQ_CODEX_LIVE="$JQ_CODEX"'
+if type == "object" and has("rate_limit")
+then .rate_limit // {} | {primary: .primary_window, secondary: .secondary_window} | limits($now)
+else error("not a usage answer") end'
+# Every limits snapshot in a session log, as "<taken at> <readings>". Lines
+# are parsed one at a time, so a line still being written is skipped rather
+# than ending the rest; limits that are not Codex's own are left out. So is a
+# snapshot with neither window: it says nothing about the limits, and taken
+# as the newest it would hide the last real reading behind "no usage limits".
+# shellcheck disable=SC2016  # a jq program: $t is jq's own
+JQ_CODEX_LOG="$JQ_CODEX"'
+fromjson? | select(type == "object" and .payload.type? == "token_count")
+| (.timestamp | epoch) as $t
+| .payload.rate_limits | select(type == "object" and (.limit_id // "codex") == "codex" and $t > 0)
+| select([(.primary | cwin($t)), (.secondary | cwin($t))] | map(select(. != null)) | length > 0)
+| "\($t) \(limits($t))"'
+
+# request <file prefix> <kind> <token> [workspace] - one GET. The headers go in
+# on stdin, so the token is never on a command line where ps could read it.
 request() {
-  printf 'Authorization: Bearer %s\n' "$2" |
-    curl -sS --max-time 10 -D "$1.hdr" -o "$1.body" -w '%{http_code}' \
-      -H @- -H "anthropic-beta: $API_BETA" -H 'Accept: application/json' \
-      -A "$PROG/$VERSION" "$API_URL" > "$1.code" 2> "$1.err"
+  local url=$API_URL args=(-H 'Accept: application/json')
+  if [ "$2" = codex ]; then url=$CODEX_URL; else args+=(-H "anthropic-beta: $API_BETA"); fi
+  {
+    printf 'Authorization: Bearer %s\n' "$3"
+    if [ "$2" = codex ]; then printf 'ChatGPT-Account-Id: %s\n' "${4:-}"; fi
+  } | curl -sS --max-time 10 -D "$1.hdr" -o "$1.body" -w '%{http_code}' \
+        -H @- "${args[@]}" -A "$PROG/$VERSION" "$url" > "$1.code" 2> "$1.err"
   printf '%s' "$?" > "$1.rc"
 }
 
@@ -342,33 +488,82 @@ mark_stale() {
 }
 
 collect() {
-  local i=$1 f="$TMPD/$1" rc code data
+  local i=$1 f="$TMPD/$1" rc code data host=api.anthropic.com
   rc=$(< "$f.rc"); code=$(< "$f.code")
+  [ "${P_KIND[i]}" = codex ] && host=chatgpt.com
   if [ "$rc" != 0 ]; then
     case $rc in
-      6|7) mark_stale "$i" "offline: cannot reach api.anthropic.com" ;;
+      6|7) mark_stale "$i" "offline: cannot reach $host" ;;
       28)  mark_stale "$i" "timed out asking for usage" ;;
       *)   mark_stale "$i" "request failed (curl exit $rc)" ;;
     esac
     return 0
   fi
+  # chatgpt.com can turn a request away before it reaches the endpoint, with a
+  # 403 page that is not JSON. That says nothing about the login.
+  if [ "$code" = 403 ] && [ "${P_KIND[i]}" = codex ] && ! jq -e 'type == "object"' "$f.body" > /dev/null 2>&1; then
+    mark_stale "$i" "chatgpt.com turned the request away (403)"
+    return 0
+  fi
   case $code in
     200) ;;
-    401|403) mark_stale "$i" "login rejected ($code): open Claude Code with ${P_SHORT[i]} to renew it"; return 0 ;;
+    401|403) renew_hint "$i"; mark_stale "$i" "login rejected ($code): $REPLY"; return 0 ;;
     429)
       HINT[i]=$(awk -F': *' 'tolower($1) == "retry-after" { sub(/\r$/, "", $2); print $2; exit }' "$f.hdr" 2> /dev/null)
       LIMITED+=("$i")
       return 0 ;;
     *)       mark_stale "$i" "usage endpoint answered $code"; return 0 ;;
   esac
-  data=$(jq -r "$JQ_USAGE" "$f.body" 2> /dev/null) || data=""
+  if [ "${P_KIND[i]}" = codex ]; then
+    data=$(jq -r --argjson now "$NOW" "$JQ_CODEX_LIVE" "$f.body" 2> /dev/null) || data=""
+  else
+    data=$(jq -r "$JQ_USAGE" "$f.body" 2> /dev/null) || data=""
+  fi
   if ! valid_data "$data"; then
     mark_stale "$i" "unexpected answer from the usage endpoint"
     return 0
   fi
-  P_DATA[i]=$data; P_ACCT[i]=${P_ID[i]}; P_AT[i]=$NOW; P_STATE[i]=ok; P_NOTE[i]=""
+  P_DATA[i]=$data; P_ACCT[i]=${P_ID[i]}; P_AT[i]=$NOW; P_STATE[i]=ok; P_NOTE[i]=""; P_SRC[i]=""
   cache_save "$i"
   backoff_clear "$i"
+}
+
+# mtime <file> - when it last changed, as an epoch, into REPLY. GNU stat
+# first, then BSD's: the two spell it differently.
+mtime() {
+  REPLY=$(stat -c %Y "$1" 2> /dev/null || stat -f %m "$1" 2> /dev/null)
+  [[ $REPLY =~ ^[0-9]+$ ]]
+}
+
+# codex_log <i> - the newest limits Codex itself was told, from its newest
+# session log, into LOG_AT and LOG_DATA. Newest by change, not by name: a
+# resumed session writes to the file it started in. A reading from before the
+# login was saved may be another account's, so only one taken after it counts,
+# and a log not written since is not opened. A token refresh rewrites the login
+# too, which only holds back the readings before it until Codex's next turn.
+codex_log() {
+  local dir=${P_DIR[$1]} f best="" since=0
+  LOG_AT=0; LOG_DATA=""
+  for f in "$dir"/sessions/*/*/*/rollout-*.jsonl; do
+    [ -f "$f" ] || continue
+    if [ -z "$best" ] || [ "$f" -nt "$best" ]; then best=$f; fi
+  done
+  [ -n "$best" ] || return 1
+  if [ -f "$dir/auth.json" ]; then
+    [ "$best" -nt "$dir/auth.json" ] || return 1
+    mtime "$dir/auth.json" && since=$REPLY
+  fi
+  read -r LOG_AT LOG_DATA < <(grep -F '"rate_limits"' "$best" | tail -n 200 |
+    jq -rR "$JQ_CODEX_LOG" 2> /dev/null | tail -n 1)
+  [[ $LOG_AT =~ ^[0-9]+$ ]] && [ "$LOG_AT" -gt "$since" ] && valid_data "$LOG_DATA"
+}
+
+# codex_fallback <i> - a Codex profile that could not be read shows what Codex
+# was last told instead, when that is newer than the reading it has
+codex_fallback() {
+  local i=$1
+  codex_log "$i" && [ "$LOG_AT" -gt "${P_AT[i]}" ] || return 0
+  P_DATA[i]=$LOG_DATA; P_AT[i]=$LOG_AT; P_ACCT[i]=${P_ID[i]}; P_STATE[i]=stale; P_SRC[i]=log
 }
 
 # Two claude-usage here can ask for one account in the same moment: one gets
@@ -395,7 +590,7 @@ settle() {
 ASKED=0; PIDS=(); LAUNCHED=()
 launch() {
   ASKED=$(( ASKED + 1 ))
-  request "$TMPD/$1" "$TOKEN" &
+  request "$TMPD/$1" "${P_KIND[$1]}" "$TOKEN" "$ACCOUNT" &
   PIDS+=("$!"); LAUNCHED+=("$1")
 }
 
@@ -417,19 +612,19 @@ reap() {
 
 # every profile at once: one slow account should not hold up the others
 fetch_all() {
-  local i j k n=${#P_DIR[@]} follow=()
+  local i j k n=${#P_DIR[@]} ago follow=()
   local -A asking=() own=()
   tick
   ASKED=0
   rm -f "$TMPD"/*
   for (( i = 0; i < n; i++ )); do
     if ! load_login "$i"; then
-      mark_stale "$i" "not logged in: no login found for ${P_SHORT[i]}"
+      mark_stale "$i" "$NO_LOGIN"
       continue
     fi
-    if [ $(( TOKEN_EXP / 1000 )) -le $(( NOW + 60 )) ]; then
-      _ago $(( NOW - TOKEN_EXP / 1000 < 0 ? 0 : NOW - TOKEN_EXP / 1000 ))
-      mark_stale "$i" "login expired $REPLY: open Claude Code with ${P_SHORT[i]} to renew it"
+    if login_expired; then
+      ago=$REPLY; renew_hint "$i"
+      mark_stale "$i" "login expired $ago: $REPLY"
       continue
     fi
     cache_fresh "$i" && continue
@@ -466,6 +661,10 @@ fetch_all() {
     backoff_load "$i"
     mark_stale "$i" "${P_NOTE[j]}"
   done
+  for (( i = 0; i < n; i++ )); do
+    [ "${P_KIND[i]}" = codex ] && [ "${P_STATE[i]}" != ok ] && codex_fallback "$i"
+  done
+  TOKEN=""; ACCOUNT=""
 }
 
 # ---------------------------------------------------------------- render ----
@@ -554,7 +753,8 @@ profile_block() {
     _clock "${P_AT[i]}"
     case ${P_STATE[i]} in
       ok) line+="  ${C_DIM}updated ${REPLY}${C_0}" ;;
-      *)  local c=$REPLY; _ago $(( NOW - P_AT[i] )); line+="  ${C_Y}as of ${c} (${REPLY})${C_0}" ;;
+      *)  local c=$REPLY; _ago $(( NOW - P_AT[i] )); line+="  ${C_Y}as of ${c} (${REPLY})${C_0}"
+          [ "${P_SRC[i]}" = log ] && line+="${C_DIM} from Codex's session log${C_0}" ;;
     esac
   fi
   OUT+=("$line")
@@ -689,13 +889,15 @@ profiles_cmd() {
   tick
   printf ' %s%-10s %-28s %s%s\n' "$C_DIM" PROFILE DIR LOGIN "$C_0"
   for (( i = 0; i < ${#P_DIR[@]}; i++ )); do
-    if ! load_login "$i"; then state="${C_R}none${C_0}"
+    if ! load_login "$i"; then
+      case $NO_LOGIN in *"API key"*) state="${C_DIM}api key${C_0}" ;; *) state="${C_R}none${C_0}" ;; esac
+    elif [ "$TOKEN_EXP" -lt 0 ]; then state="${C_G}valid${C_0}"
     elif [ $(( TOKEN_EXP / 1000 )) -le "$NOW" ]; then
       _ago $(( NOW - TOKEN_EXP / 1000 )); state="${C_Y}expired ${REPLY}${C_0}"
     else
       _clock $(( TOKEN_EXP / 1000 )); state="${C_G}valid until ${REPLY}${C_0}"
     fi
-    TOKEN=""
+    TOKEN=""; ACCOUNT=""
     printf ' %s%-10s%s %-28s %s  %s%s%s\n' "${P_COL[i]}" "${P_LABEL[i]}" "$C_0" \
       "${P_SHORT[i]}" "$state" "$C_DIM" "${P_WHO[i]}${P_PLAN[i]:+ ${P_PLAN[i]}}" "$C_0"
   done
@@ -703,7 +905,7 @@ profiles_cmd() {
 
 usage() {
   cat << EOF
-${C_B}$PROG${C_0} $VERSION - Claude Code usage limits for every profile, on one screen
+${C_B}$PROG${C_0} $VERSION - Claude Code and Codex usage limits for every profile, on one screen
 
 ${C_B}USAGE${C_0}
   $PROG               live view in a terminal, one snapshot when piped
@@ -719,6 +921,8 @@ ${C_B}PROFILES${C_0}
   Every ~/.claude-*/ directory Claude Code has used, or ~/.claude when
   there are none. CLAUDE_USAGE_DIRS picks them yourself:
     CLAUDE_USAGE_DIRS=~/.claude-work:~/.claude-personal $PROG
+  Codex profiles are ~/.codex, \$CODEX_HOME and every ~/.codex-*/ Codex has
+  used. CLAUDE_USAGE_CODEX_DIRS picks them, and set empty leaves Codex out.
 
 ${C_B}READING IT${C_0}
   5h and 7d are the rolling limits /usage shows, for the whole account: use
@@ -735,14 +939,18 @@ ${C_B}RATE LIMITS${C_0}
 
 ${C_B}LOGINS${C_0}
   A login is read, never refreshed: refreshing rotates the token and can sign
-  out a Claude session using that profile. When a login expires the profile
-  shows its last reading until Claude Code is next opened with it.
+  out a Claude or Codex session using that profile. When a login expires the
+  profile shows its last reading until it is next opened. A Codex profile
+  also shows what Codex itself was last told, from its session logs, when
+  that is newer.
 
 ${C_B}ENVIRONMENT${C_0}
-  CLAUDE_USAGE_DIRS    colon-separated config dirs to watch
-  CLAUDE_USAGE_ASCII   1 draws with # and . instead of block glyphs
-  NO_COLOR             1 turns colour off
-  XDG_CACHE_HOME       last readings are kept in \$XDG_CACHE_HOME/claude-usage
+  CLAUDE_USAGE_DIRS        colon-separated config dirs to watch
+  CLAUDE_USAGE_CODEX_DIRS  colon-separated Codex homes to watch, empty for none
+  CODEX_HOME               a Codex home to watch besides ~/.codex and ~/.codex-*
+  CLAUDE_USAGE_ASCII       1 draws with # and . instead of block glyphs
+  NO_COLOR                 1 turns colour off
+  XDG_CACHE_HOME           last readings are kept in \$XDG_CACHE_HOME/claude-usage
 EOF
 }
 
