@@ -458,12 +458,15 @@ then .rate_limit // {} | {primary: .primary_window, secondary: .secondary_window
 else error("not a usage answer") end'
 # Every limits snapshot in a session log, as "<taken at> <readings>". Lines
 # are parsed one at a time, so a line still being written is skipped rather
-# than ending the rest; limits that are not Codex's own are left out.
+# than ending the rest; limits that are not Codex's own are left out. So is a
+# snapshot with neither window: it says nothing about the limits, and taken
+# as the newest it would hide the last real reading behind "no usage limits".
 # shellcheck disable=SC2016  # a jq program: $t is jq's own
 JQ_CODEX_LOG="$JQ_CODEX"'
 fromjson? | select(type == "object" and .payload.type? == "token_count")
 | (.timestamp | epoch) as $t
 | .payload.rate_limits | select(type == "object" and (.limit_id // "codex") == "codex" and $t > 0)
+| select([(.primary | cwin($t)), (.secondary | cwin($t))] | map(select(. != null)) | length > 0)
 | "\($t) \(limits($t))"'
 
 # request <file prefix> <kind> <token> [workspace] - one GET. The headers go in

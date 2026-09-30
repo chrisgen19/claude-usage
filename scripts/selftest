@@ -523,7 +523,8 @@ mkcodex() {
   touch -t 202001010000 "$d/auth.json"
 }
 # mklog <name> - a session log whose newest Codex limits, 10 minutes old, are
-# 12% and 64%. After them come another limit's 99% and a line cut off mid-write.
+# 12% and 64%. After them come another limit's 99%, a Codex snapshot with
+# neither window, and a line cut off mid-write.
 mklog() {
   local f="$W/p/.codex-$1/sessions/2026/09/28/rollout-2026-09-28T10-00-00-$1.jsonl"
   mkdir -p "${f%/*}"
@@ -539,6 +540,8 @@ mklog() {
     jq -cn --arg ts "$(tsz $(( CN - 300 )))" --argjson a $(( CN + 3000 )) '{timestamp: $ts, type: "event_msg",
       payload: {type: "token_count", rate_limits: {limit_id: "codex_other",
         primary: {used_percent: 99.0, window_minutes: 300, resets_at: $a}}}}'
+    jq -cn --arg ts "$(tsz $(( CN - 200 )))" '{timestamp: $ts, type: "event_msg",
+      payload: {type: "token_count", rate_limits: {limit_id: "codex", primary: null, secondary: null}}}'
     printf '{"timestamp":"2026'
   } > "$f"
 }
@@ -602,6 +605,7 @@ has   "saying where it came from"                  "$co" "from Codex's session l
 has   "with the log reading's age"                 "$co" "(10m ago)"
 lacks "never another limit's numbers"              "$co" " 99%"
 lacks "nor an older reading in the same log"       "$co" " 50%"
+lacks "a snapshot with neither window is skipped"  "$co" "no usage limits reported"
 ce=$(block_of "$out" CODEX-EXPIRED)
 has   "an expired Codex login is named"            "$ce" "login expired 2h ago"
 has   "and still shows the session log"            "$ce" " 64%"
