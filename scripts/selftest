@@ -563,10 +563,15 @@ mkcodex expired  ctok-expired  -7200; mklog expired
 mkcodex oldlog   ctok-offline  3600;  mklog oldlog
 touch -t 201901010000 "$W/p/.codex-oldlog/sessions/2026/09/28/"*.jsonl
 mkcodex nologin  -             0;     mklog nologin
+# logged in after the log's last reading, then the log touched (a session
+# resumed without a turn): the file is newer, its reading is not
+mkcodex prelogin ctok-offline  3600;  mklog prelogin
+touch -t "$(printf '%(%Y%m%d%H%M)T' $(( CN - 120 )))" "$W/p/.codex-prelogin/auth.json"
+touch "$W/p/.codex-prelogin/sessions/2026/09/28/"*.jsonl
 mkdir -p "$W/p/.codex-apikey"
 printf '{"auth_mode":"apikey","OPENAI_API_KEY":"sk-codex-secret","tokens":null}' > "$W/p/.codex-apikey/auth.json"
 CDIRS=""
-for n in alpha weekly nolimits odd rejected blocked offline expired oldlog nologin apikey; do CDIRS+="$W/p/.codex-$n:"; done
+for n in alpha weekly nolimits odd rejected blocked offline expired oldlog nologin prelogin apikey; do CDIRS+="$W/p/.codex-$n:"; done
 # runcodex <dirs> <args...> - claude-usage watching only these Codex homes
 runcodex() { PATH="$W/bin:$PATH" HOME="$W/home" XDG_CACHE_HOME="$W/cache" CLAUDE_USAGE_DIRS="" CLAUDE_USAGE_CODEX_DIRS="$1" "$CU" "${@:2}"; }
 
@@ -603,6 +608,9 @@ has   "and still shows the session log"            "$ce" " 64%"
 col=$(block_of "$out" CODEX-OLDLOG)
 lacks "a log older than the login is not used"     "$col" " 12%"
 has   "so there is nothing to show"                "$col" "offline"
+cpl=$(block_of "$out" CODEX-PRELOGIN)
+lacks "nor a reading taken before the login"       "$cpl" " 12%"
+has   "even in a log written since"                "$cpl" "offline"
 cn=$(block_of "$out" CODEX-NOLOGIN)
 has   "no auth.json is not logged in"              "$cn" "not logged in"
 has   "yet the session log still shows"            "$cn" " 64%"

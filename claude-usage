@@ -208,7 +208,7 @@ discover_codex() {
   fi
   for d in "$HOME/.codex" "${CODEX_HOME:-}" "$HOME"/.codex-*/; do
     d=${d%/}
-    [ -n "$d" ] && [ -d "$d" ] || continue
+    [ -d "$d" ] || continue
     [ -f "$d/auth.json" ] || [ -d "$d/sessions" ] || continue
     case $seen in *":$d:"*) continue ;; esac
     seen+="$d:"
@@ -525,22 +525,34 @@ collect() {
   backoff_clear "$i"
 }
 
+# mtime <file> - when it last changed, as an epoch, into REPLY. GNU stat
+# first, then BSD's: the two spell it differently.
+mtime() {
+  REPLY=$(stat -c %Y "$1" 2> /dev/null || stat -f %m "$1" 2> /dev/null)
+  [[ $REPLY =~ ^[0-9]+$ ]]
+}
+
 # codex_log <i> - the newest limits Codex itself was told, from its newest
 # session log, into LOG_AT and LOG_DATA. Newest by change, not by name: a
-# resumed session writes to the file it started in. A log older than the login
-# may be another account's, so it only counts once written after it.
+# resumed session writes to the file it started in. A reading from before the
+# login was saved may be another account's, so only one taken after it counts,
+# and a log not written since is not opened. A token refresh rewrites the login
+# too, which only holds back the readings before it until Codex's next turn.
 codex_log() {
-  local dir=${P_DIR[$1]} f best=""
+  local dir=${P_DIR[$1]} f best="" since=0
   LOG_AT=0; LOG_DATA=""
   for f in "$dir"/sessions/*/*/*/rollout-*.jsonl; do
     [ -f "$f" ] || continue
     if [ -z "$best" ] || [ "$f" -nt "$best" ]; then best=$f; fi
   done
   [ -n "$best" ] || return 1
-  if [ -f "$dir/auth.json" ] && ! [ "$best" -nt "$dir/auth.json" ]; then return 1; fi
+  if [ -f "$dir/auth.json" ]; then
+    [ "$best" -nt "$dir/auth.json" ] || return 1
+    mtime "$dir/auth.json" && since=$REPLY
+  fi
   read -r LOG_AT LOG_DATA < <(grep -F '"rate_limits"' "$best" | tail -n 200 |
     jq -rR "$JQ_CODEX_LOG" 2> /dev/null | tail -n 1)
-  [[ $LOG_AT =~ ^[0-9]+$ ]] && valid_data "$LOG_DATA"
+  [[ $LOG_AT =~ ^[0-9]+$ ]] && [ "$LOG_AT" -gt "$since" ] && valid_data "$LOG_DATA"
 }
 
 # codex_fallback <i> - a Codex profile that could not be read shows what Codex

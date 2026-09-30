@@ -128,8 +128,10 @@ down, or `chatgpt.com` turns the request away, a Codex profile has a second
 source. Every Codex session logs the limits it was told on each turn, so
 `claude-usage` takes the newest from the session logs when it is newer than
 the reading it already has. It says so: `as of 09:31 (3h ago) from Codex's
-session log`. A log is only used if it was written after the login was
-saved, since an older one may belong to an account that has since logged out.
+session log`. Only a reading taken after the login was saved is used, since
+an older one may belong to an account that has since logged out. A token
+refresh saves the login too, so readings from before one wait for Codex's
+next turn.
 
 **An API key login** (`codex login --with-api-key`) is billed per token and
 has no plan limits, and says so.
