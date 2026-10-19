@@ -2,10 +2,11 @@
 
 [![ci](https://github.com/chrisgen19/claude-usage/actions/workflows/ci.yml/badge.svg)](https://github.com/chrisgen19/claude-usage/actions/workflows/ci.yml)
 
-The 5-hour and 7-day limits of every Claude Code profile you run, and of
-Codex, on one screen, without opening a session in each.
+The 5-hour and 7-day limits of every Claude Code profile you run, of Codex,
+and of Antigravity, on one screen, without opening a session in each.
 
-A single bash script. Needs `curl` and `jq`, nothing else.
+A single bash script. Needs `curl` and `jq`, nothing else, and `agy` for
+Antigravity.
 
 ```
  CLAUDE USAGE  Fri 25 Sep 12:31:41
@@ -45,7 +46,8 @@ work account has headroom before you switch to it means opening it and running
 `claude-usage` asks for all of them at once, and keeps asking.
 
 Codex has the same two windows and the same problem: `/status` shows them, but
-only inside a session. So its profiles sit on the same screen.
+only inside a session. So its profiles sit on the same screen. So does
+Antigravity, whose `/usage` has its own 5-hour and weekly limits.
 
 ## How it works
 
@@ -62,6 +64,8 @@ only inside a session. So its profiles sit on the same screen.
 5. **Adds Codex.** `~/.codex`, `$CODEX_HOME` and any `~/.codex-*/` Codex has
    used each get a `CODEX` block. The login in `auth.json` goes to the
    endpoint Codex asks for its own limits. See [Codex](#codex).
+6. **Adds Antigravity.** When `agy` is on your `PATH` and signed in, an `AGY`
+   block shows what agy's own `/usage` says. See [Antigravity](#antigravity).
 
 ## Install
 
@@ -139,6 +143,62 @@ has no plan limits, and says so.
 **Not read:** a Codex login kept in the OS keyring instead of `auth.json`.
 Its session logs still are.
 
+## Antigravity
+
+Antigravity's limits come from its CLI, `agy`, which `claude-usage` runs as
+`agy -p /usage --output-format json`: the panel `/usage` shows in a session,
+printed once. It is a slash command, not a prompt, and takes agy a few
+seconds. agy keeps one login, in `~/.gemini/antigravity-cli`, so there is one
+`AGY` block at most.
+
+```
+ AGY  alex  updated 09:34
+   gemini 5h │░░░░░░░░░░░░░░░░░░░░░░░░░   0%  resets 14:34            in 4h59m
+   gemini 7d │░░░░░░░░░░░░░░░░░░░░░░░░░   0%  resets Mon 26 Oct 09:34 in 6d23h
+   claude 5h │░░░░░░░░░░░░░░░░░░░░░░░░░   0%  resets 14:34            in 4h59m
+   claude 7d │░░░░░░░░░░░░░░░░░░░░░░░░░   0%  resets Mon 26 Oct 09:34 in 6d23h
+   argon 7d  ██│░░░░░░░░░░░░░░░░░░░░░░░  11%  resets Sun 25 Oct 15:18 in 6d5h
+```
+
+Antigravity's quota is shared by groups of models, and each group has a
+5-hour and a weekly limit. The rows are:
+
+| Row | Group |
+| --- | --- |
+| `gemini 5h`, `gemini 7d` | Gemini models |
+| `claude 5h`, `claude 7d` | Claude and GPT models (Claude Opus, Sonnet and GPT-OSS) |
+| `argon 7d` | Gemini 4 Argon, which agy reports with a weekly limit only |
+
+agy reports how much is **left**; the bars show how much is used, like every
+other row. A group agy does not report has no row. A 5h window that has not
+started yet resets 5 hours from now and stays at 0%.
+
+**Why agy and not its endpoint.** agy reads its limits from a private Google
+endpoint, and Google has disabled accounts whose Antigravity login was used by
+other tools. Running agy keeps the login inside agy: `claude-usage` never reads
+the access or refresh token, only the email in the `id_token` (for the name it
+shows and to file the reading under the right account) and whether there is a
+refresh token at all. agy renews its own login when it runs, so this block
+does not expire the way an idle Claude or Codex login does.
+
+**When agy cannot answer**, the block keeps its last reading with the reason:
+agy's own error, `agy could not sign in` when its login has lapsed (run `agy`
+to sign in again), or `timed out` after `CLAUDE_USAGE_AGY_TIMEOUT` seconds.
+With no login at all agy would wait a minute for one to be typed in, so a
+login without a refresh token is reported, and agy is not run. agy is run in
+an empty temporary directory, so it never reads a project, with nothing on
+stdin, with `BROWSER=true` in case a lapsed login would try to open a sign-in
+page, and with `AGY_CLI_DISABLE_AUTO_UPDATE=true`, since a headless agy
+otherwise starts its updater and can replace itself in place (agy takes only
+the literal `true` there: [google-antigravity/antigravity-cli#1046](https://github.com/google-antigravity/antigravity-cli/issues/1046)).
+An agy still running 2 seconds after the timeout is killed.
+
+**Not read:** an agy login kept somewhere other than
+`~/.gemini/antigravity-cli/antigravity-oauth-token`, such as the macOS
+Keychain, and the Antigravity IDE's own login. Quota belongs to the Google
+account, so an IDE signed into the same account as agy should show the same
+numbers, but that has not been checked.
+
 ## Logins
 
 A login is **read, never refreshed**. Refreshing an OAuth login rotates the
@@ -146,7 +206,8 @@ token, and rewriting it underneath a running Claude Code session can sign that
 session out. So when a login expires (after a few hours unused), the profile
 says so and keeps its last reading until you next open Claude Code with it,
 which renews the login the normal way. A Codex login is treated the same way,
-and is renewed by opening Codex.
+and is renewed by opening Codex. agy's login is not read at all: agy is run
+instead, and renews its own. See [Antigravity](#antigravity).
 
 The token never leaves memory except to go to `api.anthropic.com`, or to
 `chatgpt.com` for a Codex login:
@@ -168,6 +229,10 @@ The self test asserts all three.
 - **The usage endpoint is not a public API.** It is what Claude Code's own
   `/usage` calls, and it could change without notice. If it does, profiles show
   `unexpected answer from the usage endpoint` rather than wrong numbers.
+- **agy's JSON output is not a documented format.** It is what
+  `agy -p /usage --output-format json` prints, tried against agy 1.4.2. If it
+  changes, the `AGY` block shows `unexpected answer from agy /usage` rather
+  than wrong numbers.
 - **The Codex endpoint is not a public API either.**
   `chatgpt.com/backend-api/wham/usage` is what Codex's own client asks for
   its limits. The self test covers it through a stub, but it has not been
@@ -204,6 +269,8 @@ The self test asserts all three.
 | `CLAUDE_USAGE_DIRS` | Colon-separated config dirs to watch, e.g. `~/.claude-work:~/.claude-personal` |
 | `CLAUDE_USAGE_CODEX_DIRS` | Colon-separated Codex homes to watch. Set but empty, no Codex profiles at all |
 | `CODEX_HOME` | A Codex home to watch besides `~/.codex` and `~/.codex-*/` |
+| `CLAUDE_USAGE_AGY` | The agy command to run (default `agy`). Set but empty, no Antigravity at all |
+| `CLAUDE_USAGE_AGY_TIMEOUT` | Seconds agy gets to answer (default 30) |
 | `CLAUDE_USAGE_ASCII` | `1` draws with `#` and `.` instead of block glyphs |
 | `NO_COLOR` | `1` turns colour off |
 | `XDG_CACHE_HOME` | Last readings live in `$XDG_CACHE_HOME/claude-usage` (default `~/.cache`) |
@@ -216,10 +283,10 @@ scripts/selftest
 ```
 
 `scripts/selftest` is the whole test suite and runs anywhere, offline. `curl`
-is replaced by a stub on `PATH` that answers by token, and every profile is a
-throwaway directory. Besides the readings themselves (offsets and fractional
-seconds in reset times, plans with extra weekly limits, Codex's answers and
-session logs, every failure path), it asserts that a token never reaches a command line, the cache or the screen, and
+and `agy` are replaced by stubs on `PATH` that answer by token, and every
+profile is a throwaway directory. Besides the readings themselves (offsets and
+fractional seconds in reset times, plans with extra weekly limits, Codex's answers and
+session logs, agy's `/usage` groups, every failure path), it asserts that a token never reaches a command line, the cache or the screen, and
 that an expired login is never sent at all.
 
 Both the ci and release workflows run that same script, so a tagged release

@@ -2,8 +2,8 @@
 # selftest - assert claude-usage reads, reports and caches usage correctly,
 # and that a login never leaks into a command line, the cache or the screen.
 #
-# Nothing here touches the network or a real login: curl is a stub on PATH that
-# answers by token, and every profile is a throwaway directory. Both the ci and
+# Nothing here touches the network or a real login: curl and agy are stubs on
+# PATH that answer by token, and every profile is a throwaway directory. Both the ci and
 # release workflows run this.
 
 set -uo pipefail
@@ -11,8 +11,8 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 export NO_COLOR=1
-# a Codex home of your own must not join the suite's profiles
-unset CODEX_HOME CLAUDE_USAGE_CODEX_DIRS
+# a Codex home or agy setting of your own must not join the suite's profiles
+unset CODEX_HOME CLAUDE_USAGE_CODEX_DIRS CLAUDE_USAGE_AGY CLAUDE_USAGE_AGY_TIMEOUT
 CU=$PWD/claude-usage
 fails=0
 
@@ -665,6 +665,157 @@ n=$(HOME="$H" PATH="$W/bin:$PATH" CODEX_HOME="$H/.codex/" "$CU" profiles | grep 
 if [ "$n" = 1 ]; then pass "CODEX_HOME naming ~/.codex lists it once"; else fail "CODEX_HOME naming ~/.codex listed it $n times"; fi
 lacks "CLAUDE_USAGE_CODEX_DIRS empty leaves Codex out" \
   "$(HOME="$H" PATH="$W/bin:$PATH" CLAUDE_USAGE_CODEX_DIRS="" "$CU" profiles)" "CODEX"
+
+# ---------------------------------------------------------- antigravity ----
+# agy's login is ~/.gemini/antigravity-cli/antigravity-oauth-token: a Google
+# token beside an id_token whose claims carry the email and user. agy is asked
+# for its own /usage, so the stub answers by the access token in $HOME.
+group "antigravity"
+cat > "$W/bin/agy" << 'STUB'
+#!/usr/bin/env bash
+# stands in for agy: logs its argv, dir, BROWSER and whether it may update
+# itself, then answers /usage the way agy would for the login in $HOME
+printf '%s\n' "$*" >> "$STUB_AGY_ARGV"
+printf '%s\n' "$PWD" >> "$STUB_AGY_CWD"
+printf '%s\n' "${BROWSER:-}" >> "$STUB_AGY_ENV"
+printf '%s\n' "${AGY_CLI_DISABLE_AUTO_UPDATE:-}" >> "$STUB_AGY_UPDATE"
+tok=$(jq -r '.token.access_token // ""' "$HOME/.gemini/antigravity-cli/antigravity-oauth-token")
+printf '%s\n' "$tok" >> "$STUB_AGY_RUNS"
+case $tok in
+  atok-alpha)   cat "$STUB_FIX/agy-alpha.json" ;;
+  atok-camel)   cat "$STUB_FIX/agy-camel.json" ;;
+  atok-signin)  printf '%s\n' '{"status":"ERROR","response":"","error":"authentication failed or timed out"}'; exit 1 ;;
+  atok-broken)  printf '%s\n' '{"status":"ERROR","error":"\u001b[31mquota service unavailable"}'; exit 1 ;;
+  atok-garbage) echo 'panic: runtime error'; exit 2 ;;
+  atok-slow)    exec sleep 5 ;;
+  # a wrapper that ignores TERM: only a KILL ends it
+  atok-stubborn) trap '' TERM; exec sleep 10 ;;
+  *)            echo "stub: unknown agy login" >&2; exit 99 ;;
+esac
+STUB
+chmod +x "$W/bin/agy"
+export STUB_AGY_ARGV="$W/agy-argv.log" STUB_AGY_CWD="$W/agy-cwd.log" STUB_AGY_ENV="$W/agy-env.log"
+export STUB_AGY_RUNS="$W/agy-runs.log" STUB_AGY_UPDATE="$W/agy-update.log"
+: > "$STUB_AGY_ARGV"; : > "$STUB_AGY_CWD"; : > "$STUB_AGY_ENV"; : > "$STUB_AGY_RUNS"; : > "$STUB_AGY_UPDATE"
+AN=$(now)
+# agy's own shape, one bucket per window: Gemini's 5h has 10% gone, which
+# 1 - 0.9 reads as 9.99..., and a disabled bucket ahead of it says 50%.
+# Claude and GPT's are 92% and 71%, Argon has only a weekly 11%, and a bucket
+# of no known group says 99%. The 5h reset has 30s to spare for a slow runner.
+jq -nc --arg a "$(tsz $(( AN + 5430 )))" --arg b "$(tsz $(( AN + 300000 )))" --arg c "$(tsz $(( AN + 200000 )))" '
+def bucket($id; $w; $f; $t): {id: $id, name: "Limit Remaining", window: $w, remaining_fraction: $f, reset_time: $t};
+{conversation_id: "", status: "SUCCESS", response: "Gemini Models\t...", command: {name: "usage", data: {
+  description: "Within each group, models share a weekly limit and a 5-hour limit.",
+  groups: [
+    {name: "Gemini Models", buckets: [
+      (bucket("gemini-5h"; "5h"; 0.5; $a) + {disabled: true}),
+      bucket("gemini-weekly"; "weekly"; 0.37; $b), bucket("gemini-5h"; "5h"; 0.9; $a)]},
+    {name: "Claude and GPT models", buckets: [bucket("3p-weekly"; "weekly"; 0.29; $b), bucket("3p-5h"; "5h"; 0.08; $a)]},
+    {name: "Gemini 4 Argon", buckets: [bucket("gemini-argon-wtu-weekly"; "weekly"; 0.8893799781799316; $c)]},
+    {name: "Images", buckets: [bucket("image-5h"; "5h"; 0.01; $a)]}]}}}' > "$W/fix/agy-alpha.json"
+# the endpoint's own spelling: bucketId, remainingFraction, resetTime
+jq -nc --arg a "$(tsz $(( AN + 5400 )))" '{status: "SUCCESS", command: {name: "usage", data: {groups: [
+  {displayName: "Gemini", buckets: [{bucketId: "gemini-5h", window: "5h", remainingFraction: 0.25, resetTime: $a}]}]}}}' \
+  > "$W/fix/agy-camel.json"
+# mkagy <name> <token> [refresh token] - a home whose agy login has long
+# expired: agy renews it, so it is asked all the same
+mkagy() {
+  local d="$W/agy-$1/.gemini/antigravity-cli" id
+  mkdir -p "$d"
+  id=$(jq -cn --arg e "$1@example.com" --arg s "sub-$1" '{email: $e, sub: $s}')
+  jq -n --arg t "$2" --arg r "${3-agy-refresh-secret}" --arg id "hdr.$(b64u "$id").sig" \
+    '{token: {access_token: $t, token_type: "Bearer", refresh_token: $r, expiry: "2020-01-01T00:00:00Z"},
+      auth_method: "consumer", id_token: $id}' > "$d/antigravity-oauth-token"
+}
+for n in alpha camel signin broken garbage slow stubborn; do mkagy "$n" "atok-$n"; done
+mkagy norefresh atok-norefresh ""
+# runagy <name> <args...> - claude-usage in that agy home, with no Claude or
+# Codex profiles beside it
+runagy() { PATH="$W/bin:$PATH" HOME="$W/agy-$1" XDG_CACHE_HOME="$W/cache" CLAUDE_USAGE_DIRS="" CLAUDE_USAGE_CODEX_DIRS="" "$CU" "${@:2}"; }
+
+out=$(runagy alpha once); rc=$?
+if [ "$rc" = 0 ]; then pass "once exits 0 with an agy profile"; else fail "once with agy exited $rc"; fi
+ag=$(block_of "$out" AGY)
+has   "agy is labelled AGY, with the email's user part" "$ag" "AGY  alpha  updated"
+lacks "never the whole agy address"                "$out" "@example.com"
+has   "gemini 5h from the fraction left"           "$(printf '%s\n' "$ag" | grep 'gemini 5h')" " 10%"
+has   "and its reset"                              "$(printf '%s\n' "$ag" | grep 'gemini 5h')" "in 1h30m"
+has   "gemini 7d"                                  "$(printf '%s\n' "$ag" | grep 'gemini 7d')" " 63%"
+has   "Claude and GPT's 5h"                        "$(printf '%s\n' "$ag" | grep 'claude 5h')" " 92%"
+has   "Claude and GPT's 7d"                        "$(printf '%s\n' "$ag" | grep 'claude 7d')" " 71%"
+has   "Argon's weekly"                             "$(printf '%s\n' "$ag" | grep 'argon 7d')" " 11%"
+lacks "a disabled bucket is skipped"               "$ag" " 50%"
+lacks "a bucket of no known group is left out"     "$ag" " 99%"
+if [ "$(sort -u "$STUB_AGY_ARGV")" = "-p /usage --output-format json" ]; then pass "agy is asked for /usage as JSON"
+else fail "agy is asked for /usage as JSON (got: $(sort -u "$STUB_AGY_ARGV"))"; fi
+# by way of cd, which drops the // a TMPDIR ending in / leaves (macOS's does)
+tmpd=$(cd "$TMPDIR" && pwd)
+case $(head -n 1 "$STUB_AGY_CWD") in
+  "$tmpd"/*) pass "in an empty dir of its own" ;;
+  *) fail "in an empty dir of its own (ran in $(head -n 1 "$STUB_AGY_CWD"))" ;;
+esac
+has   "with no browser to open"                    "$(cat "$STUB_AGY_ENV")" "true"
+# agy only takes the literal "true": 1 still updates it
+if [ "$(sort -u "$STUB_AGY_UPDATE")" = true ]; then pass "and never updating itself"
+else fail "and never updating itself (got: $(sort -u "$STUB_AGY_UPDATE" | tr '\n' ' '))"; fi
+has   "the endpoint's camelCase is read too"       "$(block_of "$(runagy camel once)" AGY)" " 75%"
+
+lacks "an agy token never reaches curl" "$(cat "$STUB_TOKENS")" "atok-"
+lacks "no agy token on screen"                     "$out" "atok-"
+acache=$(cat "$W/cache/claude-usage/agy-"*)
+lacks "no agy token in the cache"                  "$acache" "atok-"
+lacks "no agy refresh token in the cache"          "$acache" "agy-refresh-secret"
+if printf '%s\n' "$acache" | grep -qvE '^[0-9]+ [0-9]+( -?[0-9]+){10}$'; then
+  fail "an agy reading holds numbers only"
+else
+  pass "an agy reading holds numbers only"
+fi
+before=$(grep -c '^atok-alpha$' "$STUB_AGY_RUNS")
+has   "an agy reading under a minute old is reused" "$(block_of "$(runagy alpha once)" AGY)" " 92%"
+if [ "$(grep -c '^atok-alpha$' "$STUB_AGY_RUNS")" = "$before" ]; then pass "without running agy again"
+else fail "an agy reading under a minute old ran agy again"; fi
+
+has   "a failed sign-in says how to renew it"      "$(block_of "$(runagy signin once)" AGY)" "agy could not sign in: run agy to sign in again"
+ab=$(block_of "$(runagy broken once)" AGY)
+has   "agy's own error is shown"                   "$ab" "agy: quota service unavailable"
+lacks "without its escape codes"                   "$ab" $'\033'
+has   "an answer that is not JSON is a failure"    "$(block_of "$(runagy garbage once)" AGY)" "agy /usage failed (exit 2)"
+t0=$(now)
+as=$(block_of "$(CLAUDE_USAGE_AGY_TIMEOUT=1 runagy slow once)" AGY)
+has   "an agy that does not answer times out"      "$as" "timed out asking agy for usage"
+if [ $(( $(now) - t0 )) -lt 4 ]; then pass "and is not waited on"
+else fail "and is not waited on (took $(( $(now) - t0 ))s)"; fi
+t0=$(now)
+as=$(block_of "$(CLAUDE_USAGE_AGY_TIMEOUT=1 runagy stubborn once)" AGY)
+has   "one that ignores TERM times out too"        "$as" "timed out asking agy for usage"
+if [ $(( $(now) - t0 )) -lt 6 ]; then pass "killed after a short grace"
+else fail "killed after a short grace (took $(( $(now) - t0 ))s)"; fi
+rejects "a timeout that is not a number"           env CLAUDE_USAGE_AGY_TIMEOUT=soon PATH="$W/bin:$PATH" HOME="$W/agy-alpha" "$CU" once
+an=$(block_of "$(runagy norefresh once)" AGY)
+has   "a login with no refresh token is no login"  "$an" "not logged in: run agy to sign in again"
+lacks "and agy is never run for it"                "$(cat "$STUB_AGY_RUNS")" "atok-norefresh"
+
+# a failure keeps the last reading: alpha's goes stale and agy breaks
+stampf "$W/cache/claude-usage/agy-sub-alpha-" $(( $(now) - 120 ))
+jq '.token.access_token = "atok-garbage"' "$W/agy-alpha/.gemini/antigravity-cli/antigravity-oauth-token" > "$W/a.json" &&
+  mv "$W/a.json" "$W/agy-alpha/.gemini/antigravity-cli/antigravity-oauth-token"
+ag=$(block_of "$(runagy alpha once)" AGY)
+has   "a failed agy keeps its last reading"        "$ag" " 92%"
+has   "and marks it as old"                        "$ag" "as of"
+
+# discovery: agy on PATH and signed in; CLAUDE_USAGE_AGY names it or turns it off
+out=$(runagy alpha profiles)
+has   "finds agy's login"                          "$out" " AGY "
+# shellcheck disable=SC2088
+has   "in ~/.gemini/antigravity-cli"               "$out" "~/.gemini/antigravity-cli"
+has   "and agy keeps it valid"                     "$(printf '%s\n' "$out" | grep '^ AGY ')" "valid"
+lacks "CLAUDE_USAGE_AGY empty leaves agy out"      "$(CLAUDE_USAGE_AGY="" runagy alpha profiles 2>&1)" "AGY"
+lacks "and so does an agy that is not installed"   "$(CLAUDE_USAGE_AGY=no-such-agy runagy alpha profiles 2>&1)" "AGY"
+has   "CLAUDE_USAGE_AGY names the command"         "$(CLAUDE_USAGE_AGY="$W/bin/agy" runagy alpha profiles)" " AGY "
+out=$(PATH="$W/bin:$PATH" HOME="$W/agy-camel" XDG_CACHE_HOME="$W/cache" CLAUDE_USAGE_DIRS="$W/p/.claude-max" \
+  CLAUDE_USAGE_CODEX_DIRS="$W/p/.codex-alpha" "$CU" once)
+has   "Claude, Codex and agy share one screen"     "$out" "MAX"
+has   "all three"                                  "$out" "AGY"
 
 # ------------------------------------------------------------- keychain ----
 # A stand-in Mac: uname says Darwin, and security answers from a directory of

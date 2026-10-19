@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# claude-usage - the 5-hour and 7-day limits of every Claude Code profile, and
-# every Codex one, on one screen, without opening a session in each.
+# claude-usage - the 5-hour and 7-day limits of every Claude Code profile,
+# every Codex one and Antigravity's, on one screen, without opening a session
+# in each.
 #
 # A profile is a CLAUDE_CONFIG_DIR. Its login is read from .credentials.json
 # there (the Keychain on macOS) and handed to the usage endpoint behind /usage.
@@ -8,9 +9,10 @@
 # endpoint Codex asks for its own limits, and its session logs stand in when
 # that cannot be read. A login is only ever read: refreshing one rotates the
 # token and can sign out a session running in that profile, so an expired
-# login is reported, never renewed.
+# login is reported, never renewed. Antigravity is asked through its own CLI,
+# agy, which renews its own login, so that login never passes through here.
 #
-# Dependencies: bash 4.2+, curl 7.55+ (for -H @-), jq.
+# Dependencies: bash 4.2+, curl 7.55+ (for -H @-), jq. agy for Antigravity.
 
 set -uo pipefail
 VERSION=0.2.0
@@ -28,6 +30,12 @@ API_BETA=oauth-2025-04-20
 # What Codex's own client asks for a ChatGPT login's limits. Not a public API
 # either, and it wants the workspace the login belongs to beside the token.
 CODEX_URL=https://chatgpt.com/backend-api/wham/usage
+# Antigravity's limits are what agy's own /usage says. With no login, agy
+# waits up to a minute for one to be typed in, so it only runs when it has a
+# login, with nothing on stdin, and never for longer than AGY_TIMEOUT.
+AGY_CMD=${CLAUDE_USAGE_AGY-agy}
+AGY_DIR=$HOME/.gemini/antigravity-cli
+AGY_TIMEOUT=${CLAUDE_USAGE_AGY_TIMEOUT:-30}
 # The endpoint allows about one read a minute per account, and answers a
 # second one with a 429. Any claude-usage on this machine reuses a reading
 # younger than READ_GAP instead of asking again, and after a 429 that account
@@ -123,12 +131,13 @@ _clock() {
 
 # -------------------------------------------------------------- profiles ----
 P_DIR=(); P_SHORT=(); P_KEY=(); P_DKEY=(); P_LABEL=(); P_COL=(); P_WHO=(); P_PLAN=()
-P_KIND=()    # claude | codex
+P_KIND=()    # claude | codex | agy
 P_SRC=()     # "log" when the shown numbers came from a Codex session log
 P_STATE=()   # pending | ok | stale | none
 P_NOTE=()    # why a profile is not fresh, shown under its name
 P_AT=()      # epoch the shown numbers were read, 0 for never
-P_DATA=()    # "5h% 5h-reset 7d% 7d-reset opus% opus-reset sonnet% sonnet-reset", -1 = absent
+P_DATA=()    # "5h% 5h-reset 7d% 7d-reset opus% opus-reset sonnet% sonnet-reset", -1 = absent;
+             # agy's: gemini 5h and 7d, then Claude and GPT's, then Argon's 7d
 P_ACCT=()    # the account P_DATA was read for, as a cksum of its id; "" for none
 P_ID=()      # the account the dir is logged into now, the same way
 P_RETRY=()   # epoch before which this account is not asked again, 0 for none
@@ -144,13 +153,15 @@ cache_key() {
   REPLY="${safe}-${sum%% *}"
 }
 
-# add_profile <dir> [claude|codex] - a Codex dir is labelled CODEX, CODEX-WORK
-# and so on, so it never reads as a Claude profile of the same name
+# add_profile <dir> [claude|codex|agy] - a Codex dir is labelled CODEX,
+# CODEX-WORK and so on, so it never reads as a Claude profile of the same name
 add_profile() {
   local dir=${1%/} kind=${2:-claude} i=${#P_DIR[@]} b
   b=${dir##*/}; b=${b#.}
   if [ "$kind" = codex ]; then
     [[ $b == codex* ]] || b="codex-$b"
+  elif [ "$kind" = agy ]; then
+    b=agy
   else
     b=${b#claude-}
     [ "$b" = claude ] && b=default
@@ -166,6 +177,7 @@ add_profile() {
     WORK)     P_COL+=("$C_Y") ;;
     PERSONAL) P_COL+=("$C_C") ;;
     CODEX)    P_COL+=("$C_BL") ;;
+    AGY)      P_COL+=("$C_M") ;;
     *) local cyc=("$C_M" "$C_BL" "$C_G" "$C_Y" "$C_C"); P_COL+=("${cyc[i % 5]}") ;;
   esac
   P_WHO+=(""); P_PLAN+=(""); P_STATE+=(pending); P_NOTE+=(""); P_AT+=(0); P_DATA+=("")
@@ -190,8 +202,9 @@ discover() {
     [ "${#P_DIR[@]}" -gt 0 ] || { [ -d "$HOME/.claude" ] && add_profile "$HOME/.claude"; }
   fi
   discover_codex
+  discover_agy
   [ "${#P_DIR[@]}" -gt 0 ] ||
-    die "no Claude Code or Codex profiles found (looked for ~/.claude-*/, ~/.claude and ~/.codex) - set CLAUDE_USAGE_DIRS"
+    die "no Claude Code, Codex or Antigravity profiles found (looked for ~/.claude-*/, ~/.claude, ~/.codex and agy) - set CLAUDE_USAGE_DIRS"
 }
 
 # CLAUDE_USAGE_CODEX_DIRS when set, and set but empty means no Codex at all.
@@ -214,6 +227,16 @@ discover_codex() {
     seen+="$d:"
     add_profile "$d" codex
   done
+}
+
+# agy keeps its state in ~/.gemini/antigravity-cli and only ever uses that,
+# so there is one AGY profile at most: when agy is on PATH and has signed in.
+# CLAUDE_USAGE_AGY names the command, and set but empty leaves Antigravity out.
+discover_agy() {
+  [ -n "$AGY_CMD" ] && command -v "$AGY_CMD" > /dev/null &&
+    [ -f "$AGY_DIR/antigravity-oauth-token" ] || return 0
+  [[ $AGY_TIMEOUT =~ ^[1-9][0-9]*$ ]] || die "CLAUDE_USAGE_AGY_TIMEOUT must be a whole number of seconds"
+  add_profile "$AGY_DIR" agy
 }
 
 # ----------------------------------------------------------------- login ----
@@ -240,14 +263,17 @@ keychain_login() {
   return 1
 }
 
+# A JWT's claims. Decoding a claim only reads it; nothing here can renew or
+# rewrite a login.
+JQ_CLAIMS='
+def claims: try (split(".")[1] | gsub("-"; "+") | gsub("_"; "/")
+  | . + ("=" * ((4 - length % 4) % 4)) | @base64d | fromjson) catch {};'
+
 # A Codex login is auth.json: the access token and the workspace it is for,
 # beside an id_token whose claims carry the email, user and plan. The access
-# token's own exp claim is when it stops working. Decoding a claim only reads
-# it; nothing here can renew or rewrite the login.
+# token's own exp claim is when it stops working.
 # shellcheck disable=SC2016  # a jq program: $t, $id and $a are jq's own
-JQ_CODEX_LOGIN='
-def claims: try (split(".")[1] | gsub("-"; "+") | gsub("_"; "/")
-  | . + ("=" * ((4 - length % 4) % 4)) | @base64d | fromjson) catch {};
+JQ_CODEX_LOGIN="$JQ_CLAIMS"'
 (.tokens // {}) as $t
 | (($t.id_token // "") | claims) as $id
 | ($id["https://api.openai.com/auth"] // {}) as $a
@@ -256,6 +282,15 @@ def claims: try (split(".")[1] | gsub("-"; "+") | gsub("_"; "/")
    $t.account_id // $a.chatgpt_account_id // "",
    $id.email // "", $a.chatgpt_user_id // $a.user_id // "", $a.chatgpt_plan_type // "",
    (if .OPENAI_API_KEY then 1 else "" end)]
+| map(tostring) | join("\u001f")'
+
+# An agy login is a Google one, and agy renews it itself. Only the id_token's
+# claims are read here, for whose limits these are, and whether there is a
+# refresh token at all: without one agy would sit waiting for a new login.
+# shellcheck disable=SC2016  # a jq program: $id is jq's own
+JQ_AGY_LOGIN="$JQ_CLAIMS"'
+(.id_token // "" | claims) as $id
+| [$id.email // "", $id.sub // "", (if (.token.refresh_token // "") != "" then 1 else "" end)]
 | map(tostring) | join("\u001f")'
 
 # login_claude <i> / login_codex <i> - set TOKEN, TOKEN_EXP (epoch ms, -1 for
@@ -291,15 +326,31 @@ login_codex() {
   return 0
 }
 
+# login_agy <i> - sets AGY_LOGIN when agy can sign itself in. TOKEN stays
+# empty: agy is asked, not its endpoint, and agy renews the token, so it has
+# no expiry worth checking here.
+login_agy() {
+  local renewable=""
+  IFS=$'\x1f' read -r L_WHO L_UUID renewable < <(jq -r "$JQ_AGY_LOGIN" "${P_DIR[$1]}/antigravity-oauth-token" 2> /dev/null)
+  TOKEN_EXP=-1
+  if [ -n "$renewable" ]; then AGY_LOGIN=1; else renew_hint "$1"; NO_LOGIN="not logged in: $REPLY"; fi
+  return 0
+}
+
 # load_login <i> - sets TOKEN, TOKEN_EXP (epoch ms, -1 when the login does not
 # say) and ACCOUNT (a Codex login's workspace), fills in who and plan, and sets
 # NO_LOGIN to why there is no token. TOKEN stays in this shell: it reaches jq
-# and curl through pipes, never argv and never a file.
+# and curl through pipes, never argv and never a file. An agy profile has no
+# TOKEN, only AGY_LOGIN to say agy can sign itself in.
 load_login() {
   local i=$1 id pre=acct
-  TOKEN=""; TOKEN_EXP=0; ACCOUNT=""; L_WHO=""; L_UUID=""; L_ORG=""; L_PLAN=""
+  TOKEN=""; TOKEN_EXP=0; ACCOUNT=""; L_WHO=""; L_UUID=""; L_ORG=""; L_PLAN=""; AGY_LOGIN=""
   NO_LOGIN="not logged in: no login found for ${P_SHORT[i]}"
-  if [ "${P_KIND[i]}" = codex ]; then login_codex "$i"; pre=codex; else login_claude "$i"; fi
+  case ${P_KIND[i]} in
+    codex) login_codex "$i"; pre=codex ;;
+    agy)   login_agy "$i"; pre=agy ;;
+    *)     login_claude "$i" ;;
+  esac
   P_WHO[i]=${L_WHO%%@*}
   # Usage belongs to an account in an organisation: one email can hold a Pro
   # plan and a Team seat, each with its own limits and its own login. Readings
@@ -317,12 +368,13 @@ load_login() {
     P_DATA[i]=""; P_AT[i]=0; P_ACCT[i]=""; P_STATE[i]=pending; P_RETRY[i]=0; P_SRC[i]=""
   fi
   P_PLAN[i]=$L_PLAN
-  [ -n "$TOKEN" ]
+  [ -n "$TOKEN" ] || [ -n "$AGY_LOGIN" ]
 }
 
 # renew_hint <i> - how to renew a profile's login
 renew_hint() {
-  if [ "${P_KIND[$1]}" != codex ]; then REPLY="open Claude Code with ${P_SHORT[$1]} to renew it"
+  if [ "${P_KIND[$1]}" = agy ]; then REPLY="run agy to sign in again"
+  elif [ "${P_KIND[$1]}" != codex ]; then REPLY="open Claude Code with ${P_SHORT[$1]} to renew it"
   elif [ "${P_DIR[$1]}" = "$HOME/.codex" ]; then REPLY="open Codex to renew it"
   else REPLY="open Codex with CODEX_HOME=${P_SHORT[$1]} to renew it"
   fi
@@ -346,7 +398,7 @@ cache_read() {
   local f="$CACHE_DIR/${P_KEY[$1]}"
   CA_AT=""; CA_ACCT=""; CA_DATA=""
   [ -f "$f" ] && read -r CA_AT CA_ACCT CA_DATA < "$f" || return 1
-  [[ $CA_AT =~ ^[0-9]+$ ]] && [[ $CA_ACCT =~ ^[0-9]+$ ]] && valid_data "$CA_DATA"
+  [[ $CA_AT =~ ^[0-9]+$ ]] && [[ $CA_ACCT =~ ^[0-9]+$ ]] && valid_data "$CA_DATA" "${PAIRS[${P_KIND[$1]}]}"
 }
 
 cache_load() {
@@ -370,7 +422,14 @@ cache_save() {
   printf '%s %s %s\n' "${P_AT[$1]}" "${P_ACCT[$1]}" "${P_DATA[$1]}" > "$f.$$" && mv -f "$f.$$" "$f"
 }
 
-valid_data() { [[ $1 =~ ^-?[0-9]+( -?[0-9]+){7}$ ]]; }
+# How many "<percent> <reset>" pairs a reading of each kind holds
+declare -A PAIRS=([claude]=4 [codex]=4 [agy]=5)
+
+# valid_data <readings> [pairs] - that many pairs of whole numbers, 4 unless said
+valid_data() {
+  local re="^-?[0-9]+( -?[0-9]+){$(( ${2:-4} * 2 - 1 ))}\$"
+  [[ $1 =~ $re ]]
+}
 
 # The wait after a 429 sits beside the cache, "<not before> <429s in a row>",
 # so every claude-usage on the machine keeps to it. A success removes it.
@@ -469,6 +528,30 @@ fromjson? | select(type == "object" and .payload.type? == "token_count")
 | select([(.primary | cwin($t)), (.secondary | cwin($t))] | map(select(. != null)) | length > 0)
 | "\($t) \(limits($t))"'
 
+# agy's /usage answers with groups of models, each with a 5-hour and a weekly
+# bucket that say how much is left rather than used. A bucket's id says which
+# group it is (gemini-5h, 3p-weekly, gemini-argon-...-weekly), so a renamed
+# group still lands on its row; any other bucket is left out. agy writes
+# snake_case where its endpoint writes camelCase, and either is read.
+# shellcheck disable=SC2016  # a jq program: $b, $f, $l and $x are jq's own
+JQ_AGY="$JQ_EPOCH"'
+def used: if type == "number" then (100 - . * 100 + 0.000001 | floor
+  | if . < 0 then 0 elif . > 100 then 100 else . end) else -1 end;
+if type == "object" and .status == "SUCCESS" and (.command.data.groups | type) == "array" then
+  [.command.data.groups[] | .buckets[]? | select(type == "object" and .disabled != true)
+   | ((.id // .bucketId // "") | ascii_downcase) as $id
+   | {fam: (if ($id | test("argon")) then "argon" elif ($id | startswith("3p")) then "3p"
+            elif ($id | startswith("gemini")) then "gemini" else null end),
+      len: ((.window // "") | ascii_downcase | if . == "5h" then "5h" elif . == "weekly" then "7d" else null end),
+      pct: ((.remaining_fraction // .remainingFraction) | used),
+      at: ((.reset_time // .resetTime) | epoch)}
+   | select(.fam != null and .len != null)] as $b
+  | [["gemini", "5h"], ["gemini", "7d"], ["3p", "5h"], ["3p", "7d"], ["argon", "7d"]]
+  | map(. as [$f, $l] | ([$b[] | select(.fam == $f and .len == $l)] | first) as $x
+      | if $x == null then "-1 -1" else "\($x.pct) \($x.at)" end)
+  | join(" ")
+else error("not a usage answer") end'
+
 # request <file prefix> <kind> <token> [workspace] - one GET. The headers go in
 # on stdin, so the token is never on a command line where ps could read it.
 request() {
@@ -482,13 +565,70 @@ request() {
   printf '%s' "$?" > "$1.rc"
 }
 
+# agy_request <file prefix> - agy's own /usage as JSON into .body and its exit
+# status into .rc. It runs in an empty dir with nothing on stdin, so it can
+# neither read a project nor wait for a login to be typed in, and a watchdog
+# stops it at AGY_TIMEOUT, leaving .timeout to say so, then kills it 2s later
+# if it is still there. BROWSER is true in case a lapsed login would open a
+# sign-in page every minute. Reading a number must not update agy, which a
+# headless run otherwise starts, and only the literal "true" turns that off.
+agy_request() {
+  local f=$1 pid dog
+  mkdir "$f.cwd" || { printf 1 > "$f.rc"; return 0; }
+  ( cd "$f.cwd" && BROWSER=true AGY_CLI_DISABLE_AUTO_UPDATE=true \
+      exec "$AGY_CMD" -p /usage --output-format json ) < /dev/null > "$f.body" 2> "$f.err" &
+  pid=$!
+  ( trap 'kill "$s" 2> /dev/null; exit 0' TERM
+    sleep "$AGY_TIMEOUT" & s=$!
+    wait "$s"; : > "$f.timeout"; kill "$pid" 2> /dev/null
+    sleep 2 & s=$!
+    wait "$s"; kill -KILL "$pid" 2> /dev/null ) &
+  dog=$!
+  # bash reports a job ended by KILL on stderr, which would land on the screen
+  wait "$pid" 2> /dev/null
+  printf '%s' "$?" > "$f.rc"
+  kill "$dog" 2> /dev/null
+  wait "$dog"
+}
+
 mark_stale() {
   P_NOTE[$1]=$2
   if [ -n "${P_DATA[$1]}" ]; then P_STATE[$1]=stale; else P_STATE[$1]=none; fi
 }
 
+# took <i> <readings> - a good reading: shown, kept, and filed for the account
+took() {
+  P_DATA[$1]=$2; P_ACCT[$1]=${P_ID[$1]}; P_AT[$1]=$NOW; P_STATE[$1]=ok; P_NOTE[$1]=""; P_SRC[$1]=""
+  cache_save "$1"
+}
+
+# A failed /usage still answers in JSON, {"status":"ERROR","error":"..."}.
+# The text is agy's, so escape sequences and other control characters are
+# dropped before it reaches the screen.
+JQ_AGY_ERROR='select(type == "object") | .error | strings
+  | gsub("\u001b\\[[0-9;?]*[A-Za-z]"; "") | gsub("[\u0000-\u001f\u007f]"; " ")'
+
+# collect_agy <i> - agy's answer, or why there is none. A whole answer counts
+# even past the watchdog: agy can finish just as it fires.
+collect_agy() {
+  local i=$1 f="$TMPD/$1" rc data err
+  rc=$(< "$f.rc")
+  data=$(jq -r "$JQ_AGY" "$f.body" 2> /dev/null) || data=""
+  if valid_data "$data" "${PAIRS[agy]}"; then took "$i" "$data"; return 0; fi
+  if [ -e "$f.timeout" ]; then mark_stale "$i" "timed out asking agy for usage"; return 0; fi
+  err=$(jq -r "$JQ_AGY_ERROR" "$f.body" 2> /dev/null | head -n 1)
+  case $err in
+    *auth*) renew_hint "$i"; mark_stale "$i" "agy could not sign in: $REPLY" ;;
+    ?*)     mark_stale "$i" "agy: ${err:0:80}" ;;
+    *) if [ "$rc" = 0 ]; then mark_stale "$i" "unexpected answer from agy /usage"
+       else mark_stale "$i" "agy /usage failed (exit $rc)"
+       fi ;;
+  esac
+}
+
 collect() {
   local i=$1 f="$TMPD/$1" rc code data host=api.anthropic.com
+  [ "${P_KIND[i]}" = agy ] && { collect_agy "$i"; return 0; }
   rc=$(< "$f.rc"); code=$(< "$f.code")
   [ "${P_KIND[i]}" = codex ] && host=chatgpt.com
   if [ "$rc" != 0 ]; then
@@ -523,8 +663,7 @@ collect() {
     mark_stale "$i" "unexpected answer from the usage endpoint"
     return 0
   fi
-  P_DATA[i]=$data; P_ACCT[i]=${P_ID[i]}; P_AT[i]=$NOW; P_STATE[i]=ok; P_NOTE[i]=""; P_SRC[i]=""
-  cache_save "$i"
+  took "$i" "$data"
   backoff_clear "$i"
 }
 
@@ -590,7 +729,9 @@ settle() {
 ASKED=0; PIDS=(); LAUNCHED=()
 launch() {
   ASKED=$(( ASKED + 1 ))
-  request "$TMPD/$1" "${P_KIND[$1]}" "$TOKEN" "$ACCOUNT" &
+  if [ "${P_KIND[$1]}" = agy ]; then agy_request "$TMPD/$1" &
+  else request "$TMPD/$1" "${P_KIND[$1]}" "$TOKEN" "$ACCOUNT" &
+  fi
   PIDS+=("$!"); LAUNCHED+=("$1")
 }
 
@@ -616,7 +757,7 @@ fetch_all() {
   local -A asking=() own=()
   tick
   ASKED=0
-  rm -f "$TMPD"/*
+  rm -rf "${TMPD:?}"/*
   for (( i = 0; i < n; i++ )); do
     if ! load_login "$i"; then
       mark_stale "$i" "$NO_LOGIN"
@@ -674,11 +815,13 @@ STATUS=""; MSG=""
 
 layout() {
   # indent 3, label, gaps, percent 4; the reset column only when it fits.
-  # The label column is only as wide as "7d sonnet" when a plan reports one.
+  # The label column is only as wide as "7d sonnet" or "gemini 5h" when a
+  # profile has one.
   local i w=() fixed
   LBLW=2
   for (( i = 0; i < ${#P_DATA[@]}; i++ )); do
     [ -n "${P_DATA[i]}" ] || continue
+    [ "${P_KIND[i]}" = agy ] && { LBLW=9; continue; }
     read -ra w <<< "${P_DATA[i]}"
     [ "${w[4]}" -ge 0 ] && [ "$LBLW" -lt 7 ] && LBLW=7
     [ "${w[6]}" -ge 0 ] && LBLW=9
@@ -745,7 +888,7 @@ window_row() {
 }
 
 profile_block() {
-  local i=$1 line note w=()
+  local i=$1 line note k w=()
   line=" ${P_COL[i]}${C_B}${P_LABEL[i]}${C_0}"
   [ -n "${P_WHO[i]}" ] && line+="  ${P_WHO[i]}"
   [ -n "${P_PLAN[i]}" ] && line+="  ${C_DIM}${P_PLAN[i]}${C_0}"
@@ -774,8 +917,17 @@ profile_block() {
     return 0
   fi
   read -ra w <<< "${P_DATA[i]}"
-  if [ "${w[0]}" -lt 0 ] && [ "${w[2]}" -lt 0 ] && [ "${w[4]}" -lt 0 ] && [ "${w[6]}" -lt 0 ]; then
+  for (( k = 0; k < ${#w[@]}; k += 2 )); do [ "${w[k]}" -ge 0 ] && break; done
+  if [ "$k" -ge "${#w[@]}" ]; then
     OUT+=("   ${C_DIM}no usage limits reported for this plan${C_0}")
+    return 0
+  fi
+  if [ "${P_KIND[i]}" = agy ]; then
+    window_row "gemini 5h" "$SPAN_5H" "${w[0]}" "${w[1]}"
+    window_row "gemini 7d" "$SPAN_7D" "${w[2]}" "${w[3]}"
+    window_row "claude 5h" "$SPAN_5H" "${w[4]}" "${w[5]}"
+    window_row "claude 7d" "$SPAN_7D" "${w[6]}" "${w[7]}"
+    window_row "argon 7d"  "$SPAN_7D" "${w[8]}" "${w[9]}"
     return 0
   fi
   window_row "5h"        "$SPAN_5H" "${w[0]}" "${w[1]}"
@@ -905,7 +1057,7 @@ profiles_cmd() {
 
 usage() {
   cat << EOF
-${C_B}$PROG${C_0} $VERSION - Claude Code and Codex usage limits for every profile, on one screen
+${C_B}$PROG${C_0} $VERSION - Claude Code, Codex and Antigravity usage limits, on one screen
 
 ${C_B}USAGE${C_0}
   $PROG               live view in a terminal, one snapshot when piped
@@ -923,12 +1075,15 @@ ${C_B}PROFILES${C_0}
     CLAUDE_USAGE_DIRS=~/.claude-work:~/.claude-personal $PROG
   Codex profiles are ~/.codex, \$CODEX_HOME and every ~/.codex-*/ Codex has
   used. CLAUDE_USAGE_CODEX_DIRS picks them, and set empty leaves Codex out.
+  Antigravity is shown when agy is on PATH and signed in. CLAUDE_USAGE_AGY
+  names the command, and set empty leaves Antigravity out.
 
 ${C_B}READING IT${C_0}
   5h and 7d are the rolling limits /usage shows, for the whole account: use
   on another machine or on claude.ai counts too. The ${MARK} in a bar is how far
   into that window you are, so a bar filled past it is on course to run out
-  before the window resets.
+  before the window resets. Antigravity's rows are per group of models:
+  gemini, claude (Claude and GPT-OSS) and argon.
 
 ${C_B}RATE LIMITS${C_0}
   The endpoint allows about one read a minute per account. A reading under
@@ -942,12 +1097,15 @@ ${C_B}LOGINS${C_0}
   out a Claude or Codex session using that profile. When a login expires the
   profile shows its last reading until it is next opened. A Codex profile
   also shows what Codex itself was last told, from its session logs, when
-  that is newer.
+  that is newer. Antigravity is read by running agy's own /usage, so agy
+  renews its own login and the login never passes through $PROG.
 
 ${C_B}ENVIRONMENT${C_0}
   CLAUDE_USAGE_DIRS        colon-separated config dirs to watch
   CLAUDE_USAGE_CODEX_DIRS  colon-separated Codex homes to watch, empty for none
   CODEX_HOME               a Codex home to watch besides ~/.codex and ~/.codex-*
+  CLAUDE_USAGE_AGY         the agy command to run (default agy), empty for none
+  CLAUDE_USAGE_AGY_TIMEOUT seconds agy gets to answer (default 30)
   CLAUDE_USAGE_ASCII       1 draws with # and . instead of block glyphs
   NO_COLOR                 1 turns colour off
   XDG_CACHE_HOME           last readings are kept in \$XDG_CACHE_HOME/claude-usage
