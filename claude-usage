@@ -603,13 +603,14 @@ took() {
 JQ_AGY_ERROR='select(type == "object") | .error | strings
   | gsub("\u001b\\[[0-9;?]*[A-Za-z]"; "") | gsub("[\u0000-\u001f\u007f]"; " ")'
 
-# collect_agy <i> - agy's answer, or why there is none
+# collect_agy <i> - agy's answer, or why there is none. A whole answer counts
+# even past the watchdog: agy can finish just as it fires.
 collect_agy() {
   local i=$1 f="$TMPD/$1" rc data err
   rc=$(< "$f.rc")
-  if [ -e "$f.timeout" ]; then mark_stale "$i" "timed out asking agy for usage"; return 0; fi
   data=$(jq -r "$JQ_AGY" "$f.body" 2> /dev/null) || data=""
   if valid_data "$data" "${PAIRS[agy]}"; then took "$i" "$data"; return 0; fi
+  if [ -e "$f.timeout" ]; then mark_stale "$i" "timed out asking agy for usage"; return 0; fi
   err=$(jq -r "$JQ_AGY_ERROR" "$f.body" 2> /dev/null | head -n 1)
   case $err in
     *auth*) renew_hint "$i"; mark_stale "$i" "agy could not sign in: $REPLY" ;;
