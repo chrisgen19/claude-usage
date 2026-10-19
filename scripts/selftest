@@ -673,11 +673,12 @@ lacks "CLAUDE_USAGE_CODEX_DIRS empty leaves Codex out" \
 group "antigravity"
 cat > "$W/bin/agy" << 'STUB'
 #!/usr/bin/env bash
-# stands in for agy: logs its argv, dir and BROWSER, then answers /usage the
-# way agy would for the login in $HOME
+# stands in for agy: logs its argv, dir, BROWSER and whether it may update
+# itself, then answers /usage the way agy would for the login in $HOME
 printf '%s\n' "$*" >> "$STUB_AGY_ARGV"
 printf '%s\n' "$PWD" >> "$STUB_AGY_CWD"
 printf '%s\n' "${BROWSER:-}" >> "$STUB_AGY_ENV"
+printf '%s\n' "${AGY_CLI_DISABLE_AUTO_UPDATE:-}" >> "$STUB_AGY_UPDATE"
 tok=$(jq -r '.token.access_token // ""' "$HOME/.gemini/antigravity-cli/antigravity-oauth-token")
 printf '%s\n' "$tok" >> "$STUB_AGY_RUNS"
 case $tok in
@@ -687,13 +688,15 @@ case $tok in
   atok-broken)  printf '%s\n' '{"status":"ERROR","error":"\u001b[31mquota service unavailable"}'; exit 1 ;;
   atok-garbage) echo 'panic: runtime error'; exit 2 ;;
   atok-slow)    exec sleep 5 ;;
+  # a wrapper that ignores TERM: only a KILL ends it
+  atok-stubborn) trap '' TERM; exec sleep 10 ;;
   *)            echo "stub: unknown agy login" >&2; exit 99 ;;
 esac
 STUB
 chmod +x "$W/bin/agy"
 export STUB_AGY_ARGV="$W/agy-argv.log" STUB_AGY_CWD="$W/agy-cwd.log" STUB_AGY_ENV="$W/agy-env.log"
-export STUB_AGY_RUNS="$W/agy-runs.log"
-: > "$STUB_AGY_ARGV"; : > "$STUB_AGY_CWD"; : > "$STUB_AGY_ENV"; : > "$STUB_AGY_RUNS"
+export STUB_AGY_RUNS="$W/agy-runs.log" STUB_AGY_UPDATE="$W/agy-update.log"
+: > "$STUB_AGY_ARGV"; : > "$STUB_AGY_CWD"; : > "$STUB_AGY_ENV"; : > "$STUB_AGY_RUNS"; : > "$STUB_AGY_UPDATE"
 AN=$(now)
 # agy's own shape, one bucket per window: Gemini's 5h has 10% gone, which
 # 1 - 0.9 reads as 9.99..., and a disabled bucket ahead of it says 50%.
@@ -724,7 +727,7 @@ mkagy() {
     '{token: {access_token: $t, token_type: "Bearer", refresh_token: $r, expiry: "2020-01-01T00:00:00Z"},
       auth_method: "consumer", id_token: $id}' > "$d/antigravity-oauth-token"
 }
-for n in alpha camel signin broken garbage slow; do mkagy "$n" "atok-$n"; done
+for n in alpha camel signin broken garbage slow stubborn; do mkagy "$n" "atok-$n"; done
 mkagy norefresh atok-norefresh ""
 # runagy <name> <args...> - claude-usage in that agy home, with no Claude or
 # Codex profiles beside it
@@ -752,6 +755,9 @@ case $(head -n 1 "$STUB_AGY_CWD") in
   *) fail "in an empty dir of its own (ran in $(head -n 1 "$STUB_AGY_CWD"))" ;;
 esac
 has   "with no browser to open"                    "$(cat "$STUB_AGY_ENV")" "true"
+# agy only takes the literal "true": 1 still updates it
+if [ "$(sort -u "$STUB_AGY_UPDATE")" = true ]; then pass "and never updating itself"
+else fail "and never updating itself (got: $(sort -u "$STUB_AGY_UPDATE" | tr '\n' ' '))"; fi
 has   "the endpoint's camelCase is read too"       "$(block_of "$(runagy camel once)" AGY)" " 75%"
 
 lacks "an agy token never reaches curl" "$(cat "$STUB_TOKENS")" "atok-"
@@ -779,6 +785,11 @@ as=$(block_of "$(CLAUDE_USAGE_AGY_TIMEOUT=1 runagy slow once)" AGY)
 has   "an agy that does not answer times out"      "$as" "timed out asking agy for usage"
 if [ $(( $(now) - t0 )) -lt 4 ]; then pass "and is not waited on"
 else fail "and is not waited on (took $(( $(now) - t0 ))s)"; fi
+t0=$(now)
+as=$(block_of "$(CLAUDE_USAGE_AGY_TIMEOUT=1 runagy stubborn once)" AGY)
+has   "one that ignores TERM times out too"        "$as" "timed out asking agy for usage"
+if [ $(( $(now) - t0 )) -lt 6 ]; then pass "killed after a short grace"
+else fail "killed after a short grace (took $(( $(now) - t0 ))s)"; fi
 rejects "a timeout that is not a number"           env CLAUDE_USAGE_AGY_TIMEOUT=soon PATH="$W/bin:$PATH" HOME="$W/agy-alpha" "$CU" once
 an=$(block_of "$(runagy norefresh once)" AGY)
 has   "a login with no refresh token is no login"  "$an" "not logged in: run agy to sign in again"

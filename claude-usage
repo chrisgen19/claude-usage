@@ -568,19 +568,24 @@ request() {
 # agy_request <file prefix> - agy's own /usage as JSON into .body and its exit
 # status into .rc. It runs in an empty dir with nothing on stdin, so it can
 # neither read a project nor wait for a login to be typed in, and a watchdog
-# stops it at AGY_TIMEOUT, leaving .timeout to say so. BROWSER is true in
-# case a lapsed login would open a sign-in page every minute.
+# stops it at AGY_TIMEOUT, leaving .timeout to say so, then kills it 2s later
+# if it is still there. BROWSER is true in case a lapsed login would open a
+# sign-in page every minute. Reading a number must not update agy, which a
+# headless run otherwise starts, and only the literal "true" turns that off.
 agy_request() {
   local f=$1 pid dog
   mkdir "$f.cwd" || { printf 1 > "$f.rc"; return 0; }
-  ( cd "$f.cwd" && BROWSER=true exec "$AGY_CMD" -p /usage --output-format json ) \
-    < /dev/null > "$f.body" 2> "$f.err" &
+  ( cd "$f.cwd" && BROWSER=true AGY_CLI_DISABLE_AUTO_UPDATE=true \
+      exec "$AGY_CMD" -p /usage --output-format json ) < /dev/null > "$f.body" 2> "$f.err" &
   pid=$!
   ( trap 'kill "$s" 2> /dev/null; exit 0' TERM
     sleep "$AGY_TIMEOUT" & s=$!
-    wait "$s"; : > "$f.timeout"; kill "$pid" 2> /dev/null ) &
+    wait "$s"; : > "$f.timeout"; kill "$pid" 2> /dev/null
+    sleep 2 & s=$!
+    wait "$s"; kill -KILL "$pid" 2> /dev/null ) &
   dog=$!
-  wait "$pid"
+  # bash reports a job ended by KILL on stderr, which would land on the screen
+  wait "$pid" 2> /dev/null
   printf '%s' "$?" > "$f.rc"
   kill "$dog" 2> /dev/null
   wait "$dog"

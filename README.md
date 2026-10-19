@@ -187,8 +187,11 @@ to sign in again), or `timed out` after `CLAUDE_USAGE_AGY_TIMEOUT` seconds.
 With no login at all agy would wait a minute for one to be typed in, so a
 login without a refresh token is reported, and agy is not run. agy is run in
 an empty temporary directory, so it never reads a project, with nothing on
-stdin, and with `BROWSER=true` in case a lapsed login would try to open a
-sign-in page.
+stdin, with `BROWSER=true` in case a lapsed login would try to open a sign-in
+page, and with `AGY_CLI_DISABLE_AUTO_UPDATE=true`, since a headless agy
+otherwise starts its updater and can replace itself in place (agy takes only
+the literal `true` there: [google-antigravity/antigravity-cli#1046](https://github.com/google-antigravity/antigravity-cli/issues/1046)).
+An agy still running 2 seconds after the timeout is killed.
 
 **Not read:** an agy login kept somewhere other than
 `~/.gemini/antigravity-cli/antigravity-oauth-token`, such as the macOS
