@@ -698,8 +698,8 @@ AN=$(now)
 # agy's own shape, one bucket per window: Gemini's 5h has 10% gone, which
 # 1 - 0.9 reads as 9.99..., and a disabled bucket ahead of it says 50%.
 # Claude and GPT's are 92% and 71%, Argon has only a weekly 11%, and a bucket
-# of no known group says 99%.
-jq -nc --arg a "$(tsz $(( AN + 5400 )))" --arg b "$(tsz $(( AN + 300000 )))" --arg c "$(tsz $(( AN + 200000 )))" '
+# of no known group says 99%. The 5h reset has 30s to spare for a slow runner.
+jq -nc --arg a "$(tsz $(( AN + 5430 )))" --arg b "$(tsz $(( AN + 300000 )))" --arg c "$(tsz $(( AN + 200000 )))" '
 def bucket($id; $w; $f; $t): {id: $id, name: "Limit Remaining", window: $w, remaining_fraction: $f, reset_time: $t};
 {conversation_id: "", status: "SUCCESS", response: "Gemini Models\t...", command: {name: "usage", data: {
   description: "Within each group, models share a weekly limit and a 5-hour limit.",
@@ -745,8 +745,10 @@ lacks "a disabled bucket is skipped"               "$ag" " 50%"
 lacks "a bucket of no known group is left out"     "$ag" " 99%"
 if [ "$(sort -u "$STUB_AGY_ARGV")" = "-p /usage --output-format json" ]; then pass "agy is asked for /usage as JSON"
 else fail "agy is asked for /usage as JSON (got: $(sort -u "$STUB_AGY_ARGV"))"; fi
+# by way of cd, which drops the // a TMPDIR ending in / leaves (macOS's does)
+tmpd=$(cd "$TMPDIR" && pwd)
 case $(head -n 1 "$STUB_AGY_CWD") in
-  "$TMPDIR"/*) pass "in an empty dir of its own" ;;
+  "$tmpd"/*) pass "in an empty dir of its own" ;;
   *) fail "in an empty dir of its own (ran in $(head -n 1 "$STUB_AGY_CWD"))" ;;
 esac
 has   "with no browser to open"                    "$(cat "$STUB_AGY_ENV")" "true"
