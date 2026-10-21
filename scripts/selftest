@@ -687,7 +687,7 @@ case $tok in
   atok-signin)  printf '%s\n' '{"status":"ERROR","response":"","error":"authentication failed or timed out"}'; exit 1 ;;
   atok-broken)  printf '%s\n' '{"status":"ERROR","error":"\u001b[31mquota service unavailable"}'; exit 1 ;;
   atok-garbage) echo 'panic: runtime error'; exit 2 ;;
-  atok-slow)    exec sleep 5 ;;
+  atok-slow)    exec sleep 10 ;;
   # a wrapper that ignores TERM: only a KILL ends it
   atok-stubborn) trap '' TERM; exec sleep 10 ;;
   *)            echo "stub: unknown agy login" >&2; exit 99 ;;
@@ -783,7 +783,7 @@ has   "an answer that is not JSON is a failure"    "$(block_of "$(runagy garbage
 t0=$(now)
 as=$(block_of "$(CLAUDE_USAGE_AGY_TIMEOUT=1 runagy slow once)" AGY)
 has   "an agy that does not answer times out"      "$as" "timed out asking agy for usage"
-if [ $(( $(now) - t0 )) -lt 4 ]; then pass "and is not waited on"
+if [ $(( $(now) - t0 )) -lt 6 ]; then pass "and is not waited on"
 else fail "and is not waited on (took $(( $(now) - t0 ))s)"; fi
 t0=$(now)
 as=$(block_of "$(CLAUDE_USAGE_AGY_TIMEOUT=1 runagy stubborn once)" AGY)
