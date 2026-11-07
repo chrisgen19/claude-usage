@@ -171,13 +171,18 @@ add_profile() {
   P_SHORT+=("${dir/#"$HOME"/\~}")
   P_KEY+=("$REPLY"); P_DKEY+=("$REPLY")
   P_LABEL+=("${b^^}")
-  # common profile names keep one colour everywhere; the rest take turns
+  # common profile names keep one colour everywhere; the rest take turns.
+  # YOSH is pinned because the cycle gave it yellow next to a yellow WORK -
+  # two Claude Code accounts the same colour in one table - and which colour
+  # it landed on moved with the number of profiles on the machine. There are
+  # five colours and six pinned names, so it shares magenta with AGY: those
+  # are rows for different tools and each carries its own label.
   case ${b^^} in
     DEV)      P_COL+=("$C_G") ;;
     WORK)     P_COL+=("$C_Y") ;;
     PERSONAL) P_COL+=("$C_C") ;;
     CODEX)    P_COL+=("$C_BL") ;;
-    AGY)      P_COL+=("$C_M") ;;
+    AGY|YOSH) P_COL+=("$C_M") ;;
     *) local cyc=("$C_M" "$C_BL" "$C_G" "$C_Y" "$C_C"); P_COL+=("${cyc[i % 5]}") ;;
   esac
   P_WHO+=(""); P_PLAN+=(""); P_STATE+=(pending); P_NOTE+=(""); P_AT+=(0); P_DATA+=("")
