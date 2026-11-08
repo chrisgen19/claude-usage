@@ -35,6 +35,10 @@ CODEX_URL=https://chatgpt.com/backend-api/wham/usage
 # login, with nothing on stdin, and never for longer than AGY_TIMEOUT.
 AGY_CMD=${CLAUDE_USAGE_AGY-agy}
 AGY_DIR=$HOME/.gemini/antigravity-cli
+# where agy keeps that login on macOS instead of a file in AGY_DIR: the
+# Keychain item for this service and account, holding the same JSON as the file
+AGY_KEYCHAIN_SVC=gemini
+AGY_KEYCHAIN_ACCT=antigravity
 AGY_TIMEOUT=${CLAUDE_USAGE_AGY_TIMEOUT:-30}
 # The endpoint allows about one read a minute per account, and answers a
 # second one with a 429. Any claude-usage on this machine reuses a reading
@@ -242,11 +246,12 @@ discover_codex() {
 }
 
 # agy keeps its state in ~/.gemini/antigravity-cli and only ever uses that,
-# so there is one AGY profile at most: when agy is on PATH and has signed in.
-# CLAUDE_USAGE_AGY names the command, and set but empty leaves Antigravity out.
+# so there is one AGY profile at most: when agy is on PATH and has signed in,
+# to a file there or, on macOS, to the Keychain. CLAUDE_USAGE_AGY names the
+# command, and set but empty leaves Antigravity out.
 discover_agy() {
-  [ -n "$AGY_CMD" ] && command -v "$AGY_CMD" > /dev/null &&
-    [ -f "$AGY_DIR/antigravity-oauth-token" ] || return 0
+  [ -n "$AGY_CMD" ] && command -v "$AGY_CMD" > /dev/null || return 0
+  [ -f "$AGY_DIR/antigravity-oauth-token" ] || agy_keychain > /dev/null || return 0
   [[ $AGY_TIMEOUT =~ ^[1-9][0-9]*$ ]] || die "CLAUDE_USAGE_AGY_TIMEOUT must be a whole number of seconds"
   add_profile "$AGY_DIR" agy
 }
@@ -273,6 +278,26 @@ keychain_login() {
     security find-generic-password -a "$USER" -s "$svc" -w 2> /dev/null && return 0
   done
   return 1
+}
+
+# agy_keychain [-w] - agy's Keychain item on macOS. -w prints the login, else
+# only whether there is one. The account is named too: another tool could keep
+# its own item under a service as plain as gemini.
+agy_keychain() {
+  [ "$PLATFORM" = darwin ] && command -v security > /dev/null &&
+    security find-generic-password -s "$AGY_KEYCHAIN_SVC" -a "$AGY_KEYCHAIN_ACCT" "$@" 2> /dev/null
+}
+
+# agy_login - agy's login on stdout: the file where agy keeps one, else the
+# Keychain item, which go-keyring may hold as go-keyring-base64:<base64>
+agy_login() {
+  local v
+  if [ -f "$AGY_DIR/antigravity-oauth-token" ]; then cat "$AGY_DIR/antigravity-oauth-token"; return; fi
+  v=$(agy_keychain -w) || return 1
+  case $v in
+    go-keyring-base64:*) printf '%s' "${v#go-keyring-base64:}" | base64 --decode ;;
+    *) printf '%s\n' "$v" ;;
+  esac
 }
 
 # A JWT's claims. Decoding a claim only reads it; nothing here can renew or
@@ -343,7 +368,7 @@ login_codex() {
 # no expiry worth checking here.
 login_agy() {
   local renewable=""
-  IFS=$'\x1f' read -r L_WHO L_UUID renewable < <(jq -r "$JQ_AGY_LOGIN" "${P_DIR[$1]}/antigravity-oauth-token" 2> /dev/null)
+  IFS=$'\x1f' read -r L_WHO L_UUID renewable < <(agy_login 2> /dev/null | jq -r "$JQ_AGY_LOGIN" 2> /dev/null)
   TOKEN_EXP=-1
   if [ -n "$renewable" ]; then AGY_LOGIN=1; else renew_hint "$1"; NO_LOGIN="not logged in: $REPLY"; fi
   return 0
