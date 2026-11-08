@@ -876,15 +876,17 @@ has   "the default ~/.claude opened with CLAUDE_CONFIG_DIR uses its hashed item"
 
 # agy on macOS keeps its login in the Keychain, not a file: service gemini,
 # account antigravity, as go-keyring stores it (base64 behind a prefix, or as
-# it is). The items here drop the id_token, so a login without one is covered
-# too: there is then no name to show
+# it is). A real item keeps the id_token, as one check here does; the others
+# drop it, so a login without one is covered too: there is then no name to show
 AGYKC="$KEYCHAIN/gemini@antigravity"
-# agyitem <name> [plain] [item] - mkagy's login for <name>, moved into the
-# Keychain as agy keeps it there
+# agyitem <name> [plain|id] [item] - mkagy's login for <name>, moved into the
+# Keychain as agy keeps it there: base64 behind go-keyring's prefix, or as it
+# is with plain. Its id_token is dropped unless id keeps it.
 agyitem() {
-  local f="$W/agy-$1/.gemini/antigravity-cli/antigravity-oauth-token" v
-  v=$(jq -c 'del(.id_token)' "$f")
-  if [ -n "${2-}" ]; then printf '%s\n' "$v"; else printf 'go-keyring-base64:%s' "$(printf '%s' "$v" | base64 | tr -d '\n')"; fi > "${3:-$AGYKC}"
+  local f="$W/agy-$1/.gemini/antigravity-cli/antigravity-oauth-token" v jqf='del(.id_token)'
+  [ "${2-}" = id ] && jqf=.
+  v=$(jq -c "$jqf" "$f")
+  if [ "${2-}" = plain ]; then printf '%s\n' "$v"; else printf 'go-keyring-base64:%s' "$(printf '%s' "$v" | base64 | tr -d '\n')"; fi > "${3:-$AGYKC}"
   rm "$f"
 }
 # macagy <name> <args...> - claude-usage on the stand-in Mac in that agy home
@@ -920,6 +922,11 @@ mkagy kcnorefresh atok-kcnorefresh ""; agyitem kcnorefresh
 has   "a Keychain login with no refresh token is no login" \
   "$(block_of "$(macagy kcnorefresh once)" AGY)" "not logged in: run agy to sign in again"
 lacks "and agy is never run for it"                "$(cat "$STUB_AGY_RUNS")" "atok-kcnorefresh"
+# as agy really keeps it on a Mac: go-keyring's base64, id_token and all
+mkagy kcid atok-alpha; agyitem kcid id
+out=$(macagy kcid once); ag=$(block_of "$out" AGY)
+has   "a Keychain login with its id_token shows the name" "$ag" "AGY  kcid  updated"
+lacks "but never the whole address"                "$out" "kcid@example.com"
 has   "a token file is read before the Keychain"   "$(block_of "$(macagy camel once)" AGY)" "AGY  camel  updated"
 rm "$AGYKC"
 lacks "with neither, there is no agy profile"      "$(macagy kc profiles 2>&1)" "AGY"
