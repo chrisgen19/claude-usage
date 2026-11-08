@@ -58,9 +58,16 @@ palette() {
   if [ "$UI_COLOR" = 1 ]; then
     C_DIM=$'\033[2m'; C_B=$'\033[1m';  C_R=$'\033[31m'; C_Y=$'\033[33m'
     C_G=$'\033[32m';  C_C=$'\033[36m'; C_M=$'\033[35m'; C_BL=$'\033[34m'
+    # orange needs a 256-colour terminal; on fewer, bright white keeps AGY
+    # apart from the five basic colours instead of falling back to plain text
+    if [ "$(tput colors 2> /dev/null || echo 0)" -ge 256 ] 2> /dev/null; then
+      C_O=$'\033[38;5;208m'
+    else
+      C_O=$'\033[97m'
+    fi
     C_0=$'\033[0m'
   else
-    C_DIM=""; C_B=""; C_R=""; C_Y=""; C_G=""; C_C=""; C_M=""; C_BL=""; C_0=""
+    C_DIM=""; C_B=""; C_R=""; C_Y=""; C_G=""; C_C=""; C_M=""; C_BL=""; C_O=""; C_0=""
   fi
   if [ "$UI_UNICODE" = 1 ]; then
     BLK=("▏" "▎" "▍" "▌" "▋" "▊" "▉" "█"); BAR_EMPTY="░"; MARK="│"
@@ -172,17 +179,17 @@ add_profile() {
   P_KEY+=("$REPLY"); P_DKEY+=("$REPLY")
   P_LABEL+=("${b^^}")
   # common profile names keep one colour everywhere; the rest take turns.
-  # YOSH is pinned because the cycle gave it yellow next to a yellow WORK -
-  # two Claude Code accounts the same colour in one table - and which colour
-  # it landed on moved with the number of profiles on the machine. There are
-  # five colours and six pinned names, so it shares magenta with AGY: those
-  # are rows for different tools and each carries its own label.
+  # YOSH is pinned because the cycle gave it yellow next to a yellow WORK
+  # (two Claude Code accounts the same colour in one table), and which colour
+  # it landed on moved with the number of profiles on the machine. YOSH keeps
+  # magenta, the colour its account is known by, so AGY moves to orange.
   case ${b^^} in
     DEV)      P_COL+=("$C_G") ;;
     WORK)     P_COL+=("$C_Y") ;;
     PERSONAL) P_COL+=("$C_C") ;;
     CODEX)    P_COL+=("$C_BL") ;;
-    AGY|YOSH) P_COL+=("$C_M") ;;
+    YOSH)     P_COL+=("$C_M") ;;
+    AGY)      P_COL+=("$C_O") ;;
     *) local cyc=("$C_M" "$C_BL" "$C_G" "$C_Y" "$C_C"); P_COL+=("${cyc[i % 5]}") ;;
   esac
   P_WHO+=(""); P_PLAN+=(""); P_STATE+=(pending); P_NOTE+=(""); P_AT+=(0); P_DATA+=("")
