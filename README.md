@@ -148,8 +148,11 @@ Its session logs still are.
 Antigravity's limits come from its CLI, `agy`, which `claude-usage` runs as
 `agy -p /usage --output-format json`: the panel `/usage` shows in a session,
 printed once. It is a slash command, not a prompt, and takes agy a few
-seconds. agy keeps one login, in `~/.gemini/antigravity-cli`, so there is one
-`AGY` block at most.
+seconds. agy keeps one login, in `~/.gemini/antigravity-cli/antigravity-oauth-token`
+or, on macOS, in the Keychain item with service `gemini` and account
+`antigravity`, so there is one `AGY` block at most. The file is read first when
+both are there. The Keychain login has no `id_token`, so on macOS the block
+shows no name.
 
 ```
  AGY  alex  updated 09:34
@@ -193,9 +196,7 @@ otherwise starts its updater and can replace itself in place (agy takes only
 the literal `true` there: [google-antigravity/antigravity-cli#1046](https://github.com/google-antigravity/antigravity-cli/issues/1046)).
 An agy still running 2 seconds after the timeout is killed.
 
-**Not read:** an agy login kept somewhere other than
-`~/.gemini/antigravity-cli/antigravity-oauth-token`, such as the macOS
-Keychain, and the Antigravity IDE's own login. Quota belongs to the Google
+**Not read:** the Antigravity IDE's own login. Quota belongs to the Google
 account, so an IDE signed into the same account as agy should show the same
 numbers, but that has not been checked.
 
@@ -255,8 +256,9 @@ The self test asserts all three.
 - **macOS reads the Keychain.** Claude Code 2.1 names the item for how it was
   started: `Claude Code-credentials` with `CLAUDE_CONFIG_DIR` unset, otherwise
   that plus `-` and the first 8 hex characters of `sha256(CLAUDE_CONFIG_DIR)`.
-  `~/.claude` tries both, every other profile the second. The first read may
-  ask for Keychain access; choose *Always Allow*. The self test covers this
+  `~/.claude` tries both, every other profile the second. agy's login is the
+  item with service `gemini` and account `antigravity`. The
+  first read may ask for Keychain access; choose *Always Allow*. The self test covers this
   through a stand-in `security`, but it has not been tried on a Mac with real
   logins yet.
 - **The timezone is yours.** Reset times are shown in local time, using bash's

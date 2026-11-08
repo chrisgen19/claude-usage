@@ -55,7 +55,25 @@ command -v jq > /dev/null || { echo "selftest: jq is required" >&2; exit 1; }
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/cu-selftest.XXXXXX") || exit 1
 trap 'rm -rf "$W"' EXIT
-mkdir -p "$W/bin" "$W/fix" "$W/p" "$W/cache/claude-usage" "$W/home" "$W/tmp"
+mkdir -p "$W/bin" "$W/fix" "$W/p" "$W/cache/claude-usage" "$W/home" "$W/tmp" "$W/keychain"
+# security answers from a directory of items, so a run on a Mac never reads
+# its real Keychain: agy's item has a fixed name that a signed-in agy would
+# answer to. An item is a file named for its service, which a lookup naming
+# any account finds, or <service>@<account>, which one naming another does not.
+cat > "$W/bin/security" << 'STUB'
+#!/usr/bin/env bash
+svc="" acct=""
+while [ $# -gt 0 ]; do
+  case $1 in -s) svc=$2; shift ;; -a) acct=$2; shift ;; esac
+  shift
+done
+if [ -n "$acct" ]; then set -- "$KEYCHAIN/$svc@$acct" "$KEYCHAIN/$svc"
+else set -- "$KEYCHAIN/$svc" "$KEYCHAIN/$svc@"*; fi
+for f; do [ -f "$f" ] && { cat "$f"; exit 0; }; done
+echo "security: item not found" >&2; exit 44
+STUB
+chmod +x "$W/bin/security"
+export KEYCHAIN="$W/keychain"
 # every run gets this temp dir, so the cleanup check at the end sees only this
 # suite's runs, not a claude-usage left open in another terminal
 export TMPDIR="$W/tmp"
@@ -679,7 +697,14 @@ printf '%s\n' "$*" >> "$STUB_AGY_ARGV"
 printf '%s\n' "$PWD" >> "$STUB_AGY_CWD"
 printf '%s\n' "${BROWSER:-}" >> "$STUB_AGY_ENV"
 printf '%s\n' "${AGY_CLI_DISABLE_AUTO_UPDATE:-}" >> "$STUB_AGY_UPDATE"
-tok=$(jq -r '.token.access_token // ""' "$HOME/.gemini/antigravity-cli/antigravity-oauth-token")
+f="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+if [ -f "$f" ]; then tok=$(jq -r '.token.access_token // ""' "$f")
+else
+  # agy on macOS: the login is in the Keychain, maybe base64 behind a prefix
+  v=$(security find-generic-password -s gemini -a antigravity -w)
+  case $v in go-keyring-base64:*) v=$(printf '%s' "${v#*:}" | base64 --decode) ;; esac
+  tok=$(printf '%s' "$v" | jq -r '.token.access_token // ""')
+fi
 printf '%s\n' "$tok" >> "$STUB_AGY_RUNS"
 case $tok in
   atok-alpha)   cat "$STUB_FIX/agy-alpha.json" ;;
@@ -818,24 +843,13 @@ has   "Claude, Codex and agy share one screen"     "$out" "MAX"
 has   "all three"                                  "$out" "AGY"
 
 # ------------------------------------------------------------- keychain ----
-# A stand-in Mac: uname says Darwin, and security answers from a directory of
-# items named the way Claude Code names them. No profile here has a
+# A stand-in Mac: uname says Darwin, and the security stub answers with items
+# named the way Claude Code names them. No profile here has a
 # .credentials.json, so every login comes through the Keychain path.
 group "macOS Keychain"
-mkdir -p "$W/macbin" "$W/keychain" "$W/mac/.claude" "$W/macw/.claude-work"
+mkdir -p "$W/macbin" "$W/mac/.claude" "$W/macw/.claude-work"
 printf '#!/usr/bin/env bash\necho Darwin\n' > "$W/macbin/uname"
-cat > "$W/macbin/security" << 'STUB'
-#!/usr/bin/env bash
-svc=""
-while [ $# -gt 0 ]; do
-  if [ "$1" = -s ]; then svc=$2; shift; fi
-  shift
-done
-[ -f "$KEYCHAIN/$svc" ] || { echo "security: item not found" >&2; exit 44; }
-cat "$KEYCHAIN/$svc"
-STUB
-chmod +x "$W/macbin/uname" "$W/macbin/security"
-export KEYCHAIN="$W/keychain"
+chmod +x "$W/macbin/uname"
 item() {
   jq -n --arg t "$2" --argjson x $(( (NOW + 3600) * 1000 )) \
     '{claudeAiOauth: {accessToken: $t, expiresAt: $x, subscriptionType: "pro"}}' > "$KEYCHAIN/$1"
@@ -859,6 +873,56 @@ rm "$KEYCHAIN/Claude Code-credentials"
 item "$(hashed "$W/mac/.claude")" tok-alpha
 has   "the default ~/.claude opened with CLAUDE_CONFIG_DIR uses its hashed item" \
   "$(mac env CLAUDE_USAGE_DIRS="$W/mac/.claude" "$CU" once)" " 45%"
+
+# agy on macOS keeps its login in the Keychain, not a file: service gemini,
+# account antigravity, as go-keyring stores it (base64 behind a prefix, or as
+# it is), and with no id_token, so there is no name to show
+AGYKC="$KEYCHAIN/gemini@antigravity"
+# agyitem <name> [plain] [item] - mkagy's login for <name>, moved into the
+# Keychain as agy keeps it there
+agyitem() {
+  local f="$W/agy-$1/.gemini/antigravity-cli/antigravity-oauth-token" v
+  v=$(jq -c 'del(.id_token)' "$f")
+  if [ -n "${2-}" ]; then printf '%s\n' "$v"; else printf 'go-keyring-base64:%s' "$(printf '%s' "$v" | base64 | tr -d '\n')"; fi > "${3:-$AGYKC}"
+  rm "$f"
+}
+# macagy <name> <args...> - claude-usage on the stand-in Mac in that agy home
+macagy() {
+  PATH="$W/macbin:$W/bin:$PATH" HOME="$W/agy-$1" XDG_CACHE_HOME="$W/mcache-$1" \
+    CLAUDE_USAGE_DIRS="" CLAUDE_USAGE_CODEX_DIRS="" "$CU" "${@:2}"
+}
+
+# another tool's gemini item, under an account that sorts ahead of agy's: a
+# lookup by service alone would find it and read its login, which has lapsed
+mkagy decoy atok-decoy ""; agyitem decoy "" "$KEYCHAIN/gemini@addon"
+mkagy kc atok-alpha; agyitem kc
+has   "agy's login in the Keychain is found"       "$(macagy kc profiles)" " AGY "
+out=$(macagy kc once); ag=$(block_of "$out" AGY)
+has   "and read as go-keyring keeps it"            "$ag" "AGY  updated"
+lacks "by its account, not another gemini item's"  "$ag" "not logged in"
+has   "so agy is asked for its usage"              "$(printf '%s\n' "$ag" | grep 'claude 5h')" " 92%"
+lacks "no Keychain agy token on screen"            "$out" "atok-"
+# with no id_token there is no account, so the reading is filed by its dir
+acache=$(cat "$W/mcache-kc/claude-usage/"*)
+if [ -n "$acache" ]; then pass "its reading is cached"; else fail "its reading is cached (cache is empty)"; fi
+lacks "nor in the cache"                           "$acache" "atok-"
+lacks "nor its refresh token"                      "$acache" "agy-refresh-secret"
+if [ "$(uname -s)" = Darwin ]; then
+  printf '  skip  the Keychain is not asked off a Mac (this is a Mac)\n'
+else
+  lacks "the Keychain is not asked off a Mac" \
+    "$(PATH="$W/bin:$PATH" HOME="$W/agy-kc" XDG_CACHE_HOME="$W/mcache-kc" CLAUDE_USAGE_DIRS="" CLAUDE_USAGE_CODEX_DIRS="" "$CU" profiles 2>&1)" "AGY"
+fi
+mkagy kcplain atok-alpha; agyitem kcplain plain
+has   "a login kept as it is is read too"          "$(block_of "$(macagy kcplain once)" AGY)" "AGY  updated"
+mkagy kcnorefresh atok-kcnorefresh ""; agyitem kcnorefresh
+has   "a Keychain login with no refresh token is no login" \
+  "$(block_of "$(macagy kcnorefresh once)" AGY)" "not logged in: run agy to sign in again"
+lacks "and agy is never run for it"                "$(cat "$STUB_AGY_RUNS")" "atok-kcnorefresh"
+has   "a token file is read before the Keychain"   "$(block_of "$(macagy camel once)" AGY)" "AGY  camel  updated"
+rm "$AGYKC"
+lacks "with neither, there is no agy profile"      "$(macagy kc profiles 2>&1)" "AGY"
+rm "$KEYCHAIN/gemini@addon"
 
 # -------------------------------------------------------------- terminal ----
 group "in a terminal"
