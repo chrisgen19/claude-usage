@@ -58,9 +58,10 @@ palette() {
   if [ "$UI_COLOR" = 1 ]; then
     C_DIM=$'\033[2m'; C_B=$'\033[1m';  C_R=$'\033[31m'; C_Y=$'\033[33m'
     C_G=$'\033[32m';  C_C=$'\033[36m'; C_M=$'\033[35m'; C_BL=$'\033[34m'
+    C_O=$'\033[38;5;208m'
     C_0=$'\033[0m'
   else
-    C_DIM=""; C_B=""; C_R=""; C_Y=""; C_G=""; C_C=""; C_M=""; C_BL=""; C_0=""
+    C_DIM=""; C_B=""; C_R=""; C_Y=""; C_G=""; C_C=""; C_M=""; C_BL=""; C_O=""; C_0=""
   fi
   if [ "$UI_UNICODE" = 1 ]; then
     BLK=("▏" "▎" "▍" "▌" "▋" "▊" "▉" "█"); BAR_EMPTY="░"; MARK="│"
@@ -176,6 +177,7 @@ add_profile() {
     DEV)      P_COL+=("$C_G") ;;
     WORK)     P_COL+=("$C_Y") ;;
     PERSONAL) P_COL+=("$C_C") ;;
+    YOSH)     P_COL+=("$C_O") ;;
     CODEX)    P_COL+=("$C_BL") ;;
     AGY)      P_COL+=("$C_M") ;;
     *) local cyc=("$C_M" "$C_BL" "$C_G" "$C_Y" "$C_C"); P_COL+=("${cyc[i % 5]}") ;;
