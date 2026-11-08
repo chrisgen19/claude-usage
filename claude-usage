@@ -36,7 +36,7 @@ CODEX_URL=https://chatgpt.com/backend-api/wham/usage
 AGY_CMD=${CLAUDE_USAGE_AGY-agy}
 AGY_DIR=$HOME/.gemini/antigravity-cli
 # where agy keeps that login on macOS instead of a file in AGY_DIR: the
-# Keychain item for this service and account, without the file's id_token
+# Keychain item for this service and account, holding the same JSON as the file
 AGY_KEYCHAIN_SVC=gemini
 AGY_KEYCHAIN_ACCT=antigravity
 AGY_TIMEOUT=${CLAUDE_USAGE_AGY_TIMEOUT:-30}

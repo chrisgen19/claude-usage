@@ -151,8 +151,9 @@ printed once. It is a slash command, not a prompt, and takes agy a few
 seconds. agy keeps one login, in `~/.gemini/antigravity-cli/antigravity-oauth-token`
 or, on macOS, in the Keychain item with service `gemini` and account
 `antigravity`, so there is one `AGY` block at most. The file is read first when
-both are there. The Keychain login has no `id_token`, so on macOS the block
-shows no name.
+both are there. The Keychain item holds the same JSON as the file (base64
+behind a `go-keyring-base64:` prefix), `id_token` included, so the block
+shows the same name either way.
 
 ```
  AGY  alex  updated 09:34

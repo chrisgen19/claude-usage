@@ -876,7 +876,8 @@ has   "the default ~/.claude opened with CLAUDE_CONFIG_DIR uses its hashed item"
 
 # agy on macOS keeps its login in the Keychain, not a file: service gemini,
 # account antigravity, as go-keyring stores it (base64 behind a prefix, or as
-# it is), and with no id_token, so there is no name to show
+# it is). The items here drop the id_token, so a login without one is covered
+# too: there is then no name to show
 AGYKC="$KEYCHAIN/gemini@antigravity"
 # agyitem <name> [plain] [item] - mkagy's login for <name>, moved into the
 # Keychain as agy keeps it there
