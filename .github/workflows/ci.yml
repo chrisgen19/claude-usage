@@ -14,7 +14,7 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install shellcheck
         run: |
@@ -46,7 +46,7 @@ jobs:
     env:
       NO_COLOR: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Self test
         run: ./scripts/selftest
@@ -57,7 +57,7 @@ jobs:
     env:
       NO_COLOR: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # macOS ships bash 3.2, which has no printf %(...)T, mapfile or ${x^^}.
       - name: Install bash 5 and jq
