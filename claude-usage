@@ -187,12 +187,14 @@ add_profile() {
   # (two Claude Code accounts the same colour in one table), and which colour
   # it landed on moved with the number of profiles on the machine. YOSH keeps
   # magenta, the colour its account is known by, so AGY moves to orange.
+  # CODEX-YOSH is the same account in Codex, so it shares YOSH's magenta
+  # instead of taking whatever the cycle hands it.
   case ${b^^} in
     DEV)      P_COL+=("$C_G") ;;
     WORK)     P_COL+=("$C_Y") ;;
     PERSONAL) P_COL+=("$C_C") ;;
     CODEX)    P_COL+=("$C_BL") ;;
-    YOSH)     P_COL+=("$C_M") ;;
+    YOSH|CODEX-YOSH) P_COL+=("$C_M") ;;
     AGY)      P_COL+=("$C_O") ;;
     *) local cyc=("$C_M" "$C_BL" "$C_G" "$C_Y" "$C_C"); P_COL+=("${cyc[i % 5]}") ;;
   esac
