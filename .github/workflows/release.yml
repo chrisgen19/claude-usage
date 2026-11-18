@@ -12,7 +12,7 @@ jobs:
     name: publish release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # A tag that disagrees with the script's own VERSION means
       # `claude-usage version` would lie to everyone who installs it.
